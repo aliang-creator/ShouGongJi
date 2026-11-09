@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.sg.shougongji.repository.YunxiaoMapper">
+    <resultMap id="connection" type="com.sg.shougongji.model.Yunxiao$ConnectionSettings">
+        <constructor>
+            <arg column="instance" javaType="string"/>
+            <arg column="organization_id" javaType="string"/>
+            <arg column="access_token" javaType="string"/>
+        </constructor>
+    </resultMap>
+
+    <resultMap id="assignee" type="com.sg.shougongji.model.Yunxiao$Assignee">
+        <constructor>
+            <arg column="member_id" javaType="string"/>
+            <arg column="name" javaType="string"/>
+        </constructor>
+    </resultMap>
+
+    <resultMap id="binding" type="com.sg.shougongji.model.Yunxiao$Binding">
+        <constructor>
+            <arg column="scope" javaType="string"/>
+            <arg column="child_id" javaType="string"/>
+            <arg column="label" javaType="string"/>
+        </constructor>
+    </resultMap>
+
+    <resultMap id="taskBinding" type="com.sg.shougongji.repository.YunxiaoMapper$TaskBinding">
+        <constructor>
+            <idArg column="task_id" javaType="_long"/>
+            <arg resultMap="binding" javaType="com.sg.shougongji.model.Yunxiao$Binding"/>
+        </constructor>
+    </resultMap>
+
+    <resultMap id="pendingWrite" type="com.sg.shougongji.model.Yunxiao$PendingWrite">
+        <constructor>
+            <arg column="marker" javaType="string"/>
+            <arg column="remote_id" javaType="string"/>
+            <arg column="fresh" javaType="_boolean"/>
+        </constructor>
+    </resultMap>
+
+    <select id="findConnection" resultMap="connection">
+        SELECT instance, organization_id, access_token FROM yunxiao_connection WHERE id = 1
+    </select>
+
+    <update id="enableSecureDelete">
+        PRAGMA secure_delete = ON
+    </update>
+
+    <insert id="saveConnection">
+        INSERT INTO yunxiao_connection (id, instance, organization_id, access_token)
+        VALUES (1, #{instance}, #{organizationId}, #{accessToken})
+        ON CONFLICT (id) DO UPDATE SET instance = excluded.instance,
+            organization_id = excluded.organization_id, access_token = excluded.access_token
+    </insert>
+
+    <delete id="deleteConnection">
+        DELETE FROM yunxiao_connection WHERE id = 1
+    </delete>
+
+    <select id="findAssignee" resultMap="assignee">
+        SELECT member_id, name FROM yunxiao_assignee_preference
+        WHERE scope = #{scope} AND member_id &lt;&gt; ''
+    </select>
+
+    <insert id="saveAssignee">
+        INSERT INTO yunxiao_assignee_preference (scope, member_id, name)
+        VALUES (#{scope}, #{assignee.memberId}, #{assignee.name})
+        ON CONFLICT (scope) DO UPDATE SET member_id = excluded.member_id, name = excluded.name
+    </insert>
+
+    <select id="findBindings" resultMap="taskBinding">
+        SELECT task_id, scope, child_id, label FROM yunxiao_binding
+    </select>
+
+    <insert id="saveBinding">
+        INSERT INTO yunxiao_binding (task_id, scope, child_id, label)
+        VALUES (#{taskId}, #{binding.scope}, #{binding.childId}, #{binding.label})
+        ON CONFLICT (task_id) DO UPDATE SET label = excluded.label
+        WHERE yunxiao_binding.scope = excluded.scope AND yunxiao_binding.child_id = excluded.child_id
+    </insert>
+
+    <select id="hasCreatedTask" resultType="boolean">
+        SELECT EXISTS (
+            SELECT 1 FROM yunxiao_write
+            WHERE task_id = #{taskId} AND scope = #{binding.scope} AND remote_id = #{binding.childId}
+              AND (operation LIKE 'project-task:%' OR operation LIKE 'child:%')
+        )
+    </select>
+
+    <select id="reserveWrite" resultMap="pendingWrite" affectData="true" flushCache="true">
+        INSERT INTO yunxiao_write (task_id, scope, operation, marker)
+        VALUES (#{taskId}, #{scope}, #{operation}, #{marker})
+        ON CONFLICT (task_id, scope, operation) DO UPDATE SET marker = yunxiao_write.marker
+        RETURNING marker, remote_id, marker = #{marker} AS fresh
+    </select>
+
+    <update id="completeWrite">
+        UPDATE yunxiao_write SET remote_id = #{remoteId} WHERE marker = #{marker}
+    </update>
+
+    <delete id="releaseWrite">
+        DELETE FROM yunxiao_write WHERE marker = #{marker} AND remote_id = ''
+    </delete>
+</mapper>
