@@ -11,8 +11,8 @@ macOS（Apple 芯片）打开 `.dmg` 安装。Windows x64 下载对应的 `.zip`
 按下快捷键，输入事项名称并回车。正在计时的话，回车会结束上一段并开始新事项。当天回到同一事项时，可以从「最近事项」再次开始，收工页会把分开的时间段汇总起来。
 
 <p>
-  <img src="screenshots/timer.png" width="360" alt="收工记主窗口，显示正在计时的事项和最近事项">
-  <img src="screenshots/quick-entry.png" width="340" alt="快捷计时输入框，输入下一件事后按回车切换">
+  <img src="https://github.com/user-attachments/assets/fa245972-612a-414f-9a71-00abda966d69" width="360" alt="收工记主窗口，显示正在计时的事项和最近事项">
+  <img src="https://github.com/user-attachments/assets/de441228-96e2-4524-b61d-0909a24ef95b" width="340" alt="快捷计时输入框，输入下一件事后按回车切换">
 </p>
 
 | 操作 | macOS | Windows |
@@ -22,13 +22,13 @@ macOS（Apple 芯片）打开 `.dmg` 安装。Windows x64 下载对应的 `.zip`
 
 主窗口最小化后，计时浮窗会留在桌面上，显示当前事项和已计时长。
 
-<img src="screenshots/mini-timer.png" width="240" alt="桌面计时浮窗，显示当前事项和已计时长">
+<img src="https://github.com/user-attachments/assets/0cb039ef-5a79-414c-82ea-f7542ac00b6b" width="240" alt="桌面计时浮窗，显示当前事项和已计时长">
 
 ## 收工时看一眼
 
 打开「收工页」，可以在「时间线」按顺序查看做过什么，也可以在「事项汇总」查看每件事一共花了多久。忘记计时可以补录，已有时间段也能编辑。点「复制清单」即可把当天记录带到日报或工作日志里。
 
-![收工页的事项汇总，展示一天的总工时和分项明细](screenshots/day-review.png)
+![收工页的事项汇总，展示一天的总工时和分项明细](https://github.com/user-attachments/assets/9e131871-307c-40fb-a4cf-59e3632525c2)
 
 ## 对接阿里云云效
 
