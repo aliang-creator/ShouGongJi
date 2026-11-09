@@ -77,10 +77,14 @@ import static com.sg.shougongji.ui.UiSupport.styleDialog;
 
 public final class DesktopApplication extends Application {
     private static final System.Logger LOGGER = System.getLogger(DesktopApplication.class.getName());
-    private static final KeyCombination QUICK_INPUT = new KeyCodeCombination(
-            KeyCode.SPACE, KeyCombination.CONTROL_DOWN, KeyCombination.SHIFT_DOWN);
-    private static final KeyCombination QUICK_PAUSE = new KeyCodeCombination(
-            KeyCode.P, KeyCombination.CONTROL_DOWN, KeyCombination.SHIFT_DOWN);
+    private static final boolean WINDOWS = com.sun.jna.Platform.isWindows();
+    private static final KeyCombination.Modifier SHORTCUT_MODIFIER =
+            WINDOWS ? KeyCombination.ALT_DOWN : KeyCombination.SHIFT_DOWN;
+    private static final String SHORTCUT_PREFIX = WINDOWS ? "Ctrl + Alt + " : "Ctrl + Shift + ";
+    private static final KeyCodeCombination QUICK_INPUT = new KeyCodeCombination(
+            KeyCode.SPACE, KeyCombination.CONTROL_DOWN, SHORTCUT_MODIFIER);
+    private static final KeyCodeCombination QUICK_PAUSE = new KeyCodeCombination(
+            KeyCode.P, KeyCombination.CONTROL_DOWN, SHORTCUT_MODIFIER);
     private static final PseudoClass COMPACT = PseudoClass.getPseudoClass("compact");
     private static final PseudoClass RUNNING = PseudoClass.getPseudoClass("running");
     private static final PseudoClass LONG_TIME = PseudoClass.getPseudoClass("long-time");
@@ -109,7 +113,7 @@ public final class DesktopApplication extends Application {
     private Timeline tick;
     private Stage timerStage;
     private MiniTimerWindow miniTimer;
-    private MacTimerHotkeys macHotkeys;
+    private TimerHotkeys systemHotkeys;
     private QuickEntry quickEntry;
 
     @Override
@@ -187,8 +191,8 @@ public final class DesktopApplication extends Application {
             miniTimer.hide();
         }
         try {
-            if (macHotkeys != null) {
-                macHotkeys.close();
+            if (systemHotkeys != null) {
+                systemHotkeys.close();
             }
         } finally {
             if (lockChannel != null) {
@@ -198,20 +202,28 @@ public final class DesktopApplication extends Application {
     }
 
     private void registerShortcuts(Scene scene) {
-        if (com.sun.jna.Platform.isMac() && !GraphicsEnvironment.isHeadless()) {
-            try {
-                macHotkeys = MacTimerHotkeys.register(this::quickEntryHotkey,
+        addWindowShortcuts(scene);
+        if (GraphicsEnvironment.isHeadless()) {
+            return;
+        }
+        try {
+            if (WINDOWS) {
+                systemHotkeys = WindowsTimerHotkeys.register(QUICK_INPUT.getCode().getCode(),
+                        QUICK_PAUSE.getCode().getCode(), () -> Platform.runLater(() -> openQuickEntry(true)),
+                        () -> Platform.runLater(this::pauseTimer));
+                shortcutScope.setText("Windows 全局快捷键已启用");
+            } else if (com.sun.jna.Platform.isMac()) {
+                systemHotkeys = MacTimerHotkeys.register(this::quickEntryMacHotkey,
                         () -> Platform.runLater(this::pauseTimer));
                 shortcutScope.setText("macOS 全局快捷键已启用");
-            } catch (RuntimeException | LinkageError failure) {
-                shortcutScope.setText("全局键注册失败 · 窗口内可用");
-                LOGGER.log(System.Logger.Level.WARNING, "Could not register macOS timer shortcuts", failure);
             }
+        } catch (RuntimeException | LinkageError failure) {
+            shortcutScope.setText("全局键注册失败 · 窗口内可用");
+            LOGGER.log(System.Logger.Level.WARNING, "Could not register system timer shortcuts", failure);
         }
-        addWindowShortcuts(scene);
     }
 
-    private void quickEntryHotkey() {
+    private void quickEntryMacHotkey() {
         if (modalIsOpen()) {
             return;
         }
@@ -235,13 +247,17 @@ public final class DesktopApplication extends Application {
     }
 
     private void openQuickEntry() {
+        openQuickEntry(false);
+    }
+
+    private void openQuickEntry(boolean activateWindows) {
         if (modalIsOpen()) {
             return;
         }
         if (quickEntry == null) {
             quickEntry = new QuickEntry();
         }
-        quickEntry.show();
+        quickEntry.show(activateWindows);
     }
 
     private void pauseTimer() {
@@ -286,7 +302,7 @@ public final class DesktopApplication extends Application {
             return (Stage) dialog.getDialogPane().getScene().getWindow();
         }
 
-        void show() {
+        void show(boolean activateWindows) {
             if (!dialog.isShowing()) {
                 dialog.show();
                 window().setAlwaysOnTop(true);
@@ -294,6 +310,13 @@ public final class DesktopApplication extends Application {
             }
             Stage window = window();
             window.toFront();
+            if (activateWindows) {
+                try {
+                    WindowsTimerHotkeys.activateWindow(window.getTitle());
+                } catch (RuntimeException | LinkageError failure) {
+                    LOGGER.log(System.Logger.Level.WARNING, "Could not activate the quick timer window", failure);
+                }
+            }
             window.requestFocus();
             input.requestFocus();
         }
@@ -318,9 +341,9 @@ public final class DesktopApplication extends Application {
             }
             review.show();
         }));
-        MenuItem quickInput = new MenuItem("开始或切换   Ctrl + Shift + 空格");
+        MenuItem quickInput = new MenuItem("开始或切换   " + SHORTCUT_PREFIX + "空格");
         quickInput.setOnAction(event -> openQuickEntry());
-        MenuItem quickPause = new MenuItem("暂停   Ctrl + Shift + P");
+        MenuItem quickPause = new MenuItem("暂停   " + SHORTCUT_PREFIX + "P");
         quickPause.disableProperty().bind(pause.disableProperty());
         quickPause.setOnAction(event -> pauseTimer());
         shortcutScope.setDisable(true);

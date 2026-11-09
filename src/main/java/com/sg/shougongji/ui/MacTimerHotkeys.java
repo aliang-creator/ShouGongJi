@@ -7,7 +7,7 @@ import com.sun.jna.Pointer;
 import com.sun.jna.platform.mac.Carbon;
 import com.sun.jna.ptr.PointerByReference;
 
-final class MacTimerHotkeys implements AutoCloseable {
+final class MacTimerHotkeys implements TimerHotkeys {
     private static final int KEYBOARD_EVENT = 0x6b657962; // 'keyb'
     private static final int HOTKEY_PRESSED = 5;
     private static final int DIRECT_OBJECT = 0x2d2d2d2d; // '----'
