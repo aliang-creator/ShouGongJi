@@ -1,5 +1,6 @@
 package com.sg.shougongji.ui;
 
+import javafx.animation.AnimationTimer;
 import javafx.beans.value.ObservableValue;
 import javafx.collections.ObservableList;
 import javafx.geometry.Pos;
@@ -30,6 +31,16 @@ final class MiniTimerWindow extends Stage {
 
     private double dragX;
     private double dragY;
+    private double nextX;
+    private double nextY;
+    private boolean positionPending;
+    private final AnimationTimer move = new AnimationTimer() {
+        @Override
+        public void handle(long now) {
+            stop();
+            applyPosition();
+        }
+    };
 
     MiniTimerWindow(Stage timer, ObservableValue<String> title, ObservableValue<String> time) {
         super(StageStyle.TRANSPARENT);
@@ -69,8 +80,16 @@ final class MiniTimerWindow extends Stage {
         });
         readout.setOnMouseDragged(event -> {
             if (event.isPrimaryButtonDown()) {
-                setX(event.getScreenX() - dragX);
-                setY(event.getScreenY() - dragY);
+                nextX = event.getScreenX() - dragX;
+                nextY = event.getScreenY() - dragY;
+                positionPending = true;
+                move.start();
+            }
+        });
+        readout.setOnMouseReleased(event -> {
+            if (event.getButton() == MouseButton.PRIMARY) {
+                move.stop();
+                applyPosition();
             }
         });
 
@@ -91,6 +110,23 @@ final class MiniTimerWindow extends Stage {
         scene.getStylesheets().add(UiSupport.STYLES);
         setScene(scene);
         setOnShowing(event -> placeIfNeeded(timer));
+        setOnHidden(event -> {
+            move.stop();
+            positionPending = false;
+        });
+    }
+
+    private void applyPosition() {
+        if (!positionPending) {
+            return;
+        }
+        positionPending = false;
+        if (nextX != getX()) {
+            setX(nextX);
+        }
+        if (nextY != getY()) {
+            setY(nextY);
+        }
     }
 
     private void placeIfNeeded(Stage timer) {

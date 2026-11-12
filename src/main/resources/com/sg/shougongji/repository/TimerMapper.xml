@@ -24,18 +24,20 @@
 
     <sql id="sessionWithTask">
         SELECT s.id AS session_id, s.started_at, s.ended_at, s.note, s.manual, s.estimated,
-               t.id AS task_id, t.title, t.work_item
+               t.id AS task_id, COALESCE(c.display_title, t.title) AS title, t.work_item
         FROM work_session s JOIN task t ON t.id = s.task_id
+        LEFT JOIN yunxiao_timer_task c ON c.task_id = t.id
     </sql>
 
     <select id="findTasks" resultMap="task">
-        SELECT t.id AS task_id, t.title, t.work_item
+        SELECT t.id AS task_id, COALESCE(c.display_title, t.title) AS title, t.work_item
         FROM task t JOIN work_session s ON t.id = s.task_id
+        LEFT JOIN yunxiao_timer_task c ON c.task_id = t.id
         <if test="recentOnly">
             WHERE NOT EXISTS (SELECT 1 FROM hidden_recent_task h WHERE h.task_id = t.id)
         </if>
         GROUP BY t.id
-        ORDER BY MAX(s.started_at) DESC, t.title
+        ORDER BY MAX(s.started_at) DESC, title
     </select>
 
     <insert id="insertTaskIfAbsent">
@@ -46,6 +48,20 @@
     <select id="findTaskId" resultType="long">
         SELECT id FROM task WHERE title = #{title}
     </select>
+
+    <select id="taskExists" resultType="boolean">
+        SELECT EXISTS (SELECT 1 FROM task WHERE id = #{taskId})
+    </select>
+
+    <select id="automaticallyRegistersEffort" resultType="boolean">
+        SELECT EXISTS (SELECT 1 FROM yunxiao_auto_task WHERE task_id = #{taskId})
+    </select>
+
+    <insert id="enqueueEffort">
+        INSERT INTO yunxiao_auto_effort (task_id, day, revision)
+        VALUES (#{taskId}, #{day}, lower(hex(randomblob(16))))
+        ON CONFLICT (task_id, day) DO UPDATE SET revision = excluded.revision
+    </insert>
 
     <update id="updateWorkItem">
         UPDATE task SET work_item = #{workItem} WHERE id = #{taskId}
@@ -81,8 +97,9 @@
     </select>
 
     <select id="findOverlappingTaskTitle" resultType="string">
-        SELECT t.title
+        SELECT COALESCE(c.display_title, t.title)
         FROM work_session s JOIN task t ON t.id = s.task_id
+        LEFT JOIN yunxiao_timer_task c ON c.task_id = t.id
         WHERE s.id &lt;&gt; #{sessionIdToIgnore}
           AND s.started_at &lt; #{endedAt}
           AND (s.ended_at IS NULL OR s.ended_at &gt; #{startedAt})

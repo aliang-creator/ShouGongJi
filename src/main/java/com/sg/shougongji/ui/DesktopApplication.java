@@ -4,8 +4,13 @@ import com.sg.shougongji.AppServices;
 import com.sg.shougongji.model.DayReview;
 import com.sg.shougongji.model.WorkSession;
 import com.sg.shougongji.model.WorkTask;
+import com.sg.shougongji.model.Yunxiao.Binding;
+import com.sg.shougongji.model.Yunxiao.PendingEffort;
 import com.sg.shougongji.service.ReviewService;
 import com.sg.shougongji.service.TimerService;
+import com.sg.shougongji.service.YunxiaoAutoSync;
+import com.sg.shougongji.service.YunxiaoService;
+import com.sg.shougongji.service.YunxiaoSettingsService;
 import javafx.animation.KeyFrame;
 import javafx.animation.Timeline;
 import javafx.application.Application;
@@ -13,6 +18,7 @@ import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
 import javafx.beans.value.ChangeListener;
 import javafx.collections.ObservableList;
+import javafx.concurrent.Task;
 import javafx.css.PseudoClass;
 import javafx.geometry.Pos;
 import javafx.scene.Group;
@@ -58,15 +64,17 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import static com.sg.shougongji.ui.UiSupport.appScene;
+import static com.sg.shougongji.ui.UiSupport.background;
 import static com.sg.shougongji.ui.UiSupport.bindSave;
 import static com.sg.shougongji.ui.UiSupport.button;
 import static com.sg.shougongji.ui.UiSupport.clockDisplay;
 import static com.sg.shougongji.ui.UiSupport.field;
 import static com.sg.shougongji.ui.UiSupport.form;
 import static com.sg.shougongji.ui.UiSupport.formatTime;
-import static com.sg.shougongji.ui.UiSupport.glassScene;
 import static com.sg.shougongji.ui.UiSupport.icon;
 import static com.sg.shougongji.ui.UiSupport.label;
 import static com.sg.shougongji.ui.UiSupport.parseTime;
@@ -81,6 +89,7 @@ public final class DesktopApplication extends Application {
     private static final KeyCombination.Modifier SHORTCUT_MODIFIER =
             WINDOWS ? KeyCombination.ALT_DOWN : KeyCombination.SHIFT_DOWN;
     private static final String SHORTCUT_PREFIX = WINDOWS ? "Ctrl + Alt + " : "Ctrl + Shift + ";
+    private static final String CLOUD_START_LABEL = "从云效开始…";
     private static final KeyCodeCombination QUICK_INPUT = new KeyCodeCombination(
             KeyCode.SPACE, KeyCombination.CONTROL_DOWN, SHORTCUT_MODIFIER);
     private static final KeyCodeCombination QUICK_PAUSE = new KeyCodeCombination(
@@ -100,6 +109,7 @@ public final class DesktopApplication extends Application {
     private final VBox recent = new VBox();
     private final Button start = button("开始计时", "primary");
     private final Button pause = button("暂停", "secondary");
+    private final Button cloudSync = button("云效待同步", "subtle");
     private final MenuItem shortcutScope = new MenuItem("在收工记窗口内可用");
 
     private FileChannel lockChannel;
@@ -108,8 +118,17 @@ public final class DesktopApplication extends Application {
     private ReviewService reviewService;
     private WorkSession active;
     private LocalDate timerDate;
+    private long displayedSeconds = -1;
+    private Task<RecentSnapshot> recentLoad;
+    private long recentRevision;
     private ReviewWindow review;
     private YunxiaoDialogs yunxiao;
+    private YunxiaoSettingsService yunxiaoSettings;
+    private YunxiaoAutoSync autoSync;
+    private Task<YunxiaoAutoSync.Failure> autoSyncTask;
+    private YunxiaoAutoSync.Failure autoSyncFailure;
+    private Throwable autoSyncError;
+    private boolean autoSyncAgain;
     private Timeline tick;
     private Stage timerStage;
     private MiniTimerWindow miniTimer;
@@ -132,7 +151,9 @@ public final class DesktopApplication extends Application {
             AppServices services = AppServices.open(dataDirectory.resolve("worklog.sqlite"), clock);
             timer = services.timer();
             reviewService = services.review();
-            yunxiao = new YunxiaoDialogs(services.yunxiaoSettings(), getHostServices()::showDocument);
+            yunxiaoSettings = services.yunxiaoSettings();
+            autoSync = services.yunxiaoAutoSync();
+            yunxiao = new YunxiaoDialogs(yunxiaoSettings, getHostServices()::showDocument);
             refresh();
         } catch (IOException | SQLException failure) {
             showError(null, failure instanceof SQLException
@@ -143,14 +164,14 @@ public final class DesktopApplication extends Application {
 
         stage.setTitle("收工记");
         VBox content = timerContent();
-        Scene scene = glassScene(content, 394, -1);
+        Scene scene = appScene(content, 394, -1);
         ChangeListener<Number> resize = (property, previous, value) -> content.pseudoClassStateChanged(COMPACT,
                 scene.getWidth() < 355 || scene.getHeight() > 0 && scene.getHeight() < 455);
         scene.widthProperty().addListener(resize);
         scene.heightProperty().addListener(resize);
         stage.setScene(scene);
         stage.setMinWidth(320);
-        stage.setMinHeight(430);
+        stage.setMinHeight(455);
         stage.setAlwaysOnTop(true);
         stage.iconifiedProperty().addListener((property, previous, minimized) -> updateMiniTimer());
         stage.showingProperty().addListener((property, previous, showing) -> updateMiniTimer());
@@ -177,7 +198,10 @@ public final class DesktopApplication extends Application {
         tick.play();
         Platform.runLater(() -> {
             if (active == null || recover()) {
-                perform(stage, () -> yunxiao.offerDefaultAssignee(stage));
+                perform(stage, () -> {
+                    requestAutoSync();
+                    yunxiao.offerDefaultAssignee(stage);
+                });
             }
         });
     }
@@ -189,6 +213,12 @@ public final class DesktopApplication extends Application {
         }
         if (miniTimer != null) {
             miniTimer.hide();
+        }
+        if (autoSyncTask != null) {
+            autoSyncTask.cancel();
+        }
+        if (recentLoad != null) {
+            recentLoad.cancel();
         }
         try {
             if (systemHotkeys != null) {
@@ -242,7 +272,7 @@ public final class DesktopApplication extends Application {
     }
 
     private boolean modalIsOpen() {
-        return Window.getWindows().stream().anyMatch(window ->
+        return review != null && review.isEffortOpen() || Window.getWindows().stream().anyMatch(window ->
                 window instanceof Stage stage && stage.getModality() != Modality.NONE);
     }
 
@@ -266,6 +296,7 @@ public final class DesktopApplication extends Application {
             perform(owner, () -> {
                 timer.pause(active.id(), clock.instant(), false);
                 refresh();
+                requestAutoSync();
             });
         }
     }
@@ -282,7 +313,10 @@ public final class DesktopApplication extends Application {
             current.textProperty().bind(Bindings.concat("正在计时 · ", activeTitle.textProperty()));
             current.visibleProperty().bind(activeTitle.textProperty().isNotEmpty());
             current.managedProperty().bind(current.visibleProperty());
-            VBox fields = new VBox(9, current, field("事项", input), label("回车确认，Esc 取消", "muted"));
+            Button cloud = button(CLOUD_START_LABEL, "subtle");
+            HBox shortcuts = new HBox(8, label("回车确认，Esc 取消", "muted"), spacer(), cloud);
+            shortcuts.setAlignment(Pos.CENTER_LEFT);
+            VBox fields = new VBox(9, current, field("事项", input), shortcuts);
             dialog = form(null, "快捷计时", fields, "开始计时");
             dialog.initModality(Modality.NONE);
             dialog.getDialogPane().getStyleClass().add("quick-timer");
@@ -295,6 +329,16 @@ public final class DesktopApplication extends Application {
                     () -> input.getText().isBlank(), input.textProperty()));
             input.setOnAction(event -> confirm.fire());
             bindSave(dialog, () -> startTask(input.getText()));
+            cloud.setOnAction(event -> perform(window(), () -> {
+                String title = input.getText().isBlank() ? taskInput.getText() : input.getText();
+                startCloudTask(window(), title, started -> {
+                    if (started) {
+                        dialog.close();
+                    } else {
+                        input.requestFocus();
+                    }
+                });
+            }));
             dialog.setOnHidden(event -> quickEntry = null);
         }
 
@@ -380,7 +424,7 @@ public final class DesktopApplication extends Application {
         return new Group(dial);
     }
 
-    private HBox createTimerControls() {
+    private VBox createTimerControls() {
         pause.getStyleClass().add("timer-pause");
         pause.setGraphic(icon("M3.5 2.5 V9.5 M8 2.5 V9.5"));
         pause.setMinWidth(Region.USE_PREF_SIZE);
@@ -398,7 +442,14 @@ public final class DesktopApplication extends Application {
         composer.setAlignment(Pos.CENTER_LEFT);
         composer.getStyleClass().add("timer-composer");
         HBox.setHgrow(taskInput, Priority.ALWAYS);
-        return composer;
+        Button cloud = button(CLOUD_START_LABEL, "subtle");
+        cloud.setOnAction(event -> perform(timerStage,
+                () -> startCloudTask(timerStage, taskInput.getText(), ignored -> {})));
+        cloudSync.managedProperty().bind(cloudSync.visibleProperty());
+        cloudSync.setOnAction(event -> perform(timerStage, () -> retryAutoSync(timerStage)));
+        HBox cloudActions = new HBox(4, cloud, spacer(), cloudSync);
+        cloudActions.setAlignment(Pos.CENTER_LEFT);
+        return new VBox(3, composer, cloudActions);
     }
 
     private VBox createRecentSection() {
@@ -418,10 +469,7 @@ public final class DesktopApplication extends Application {
 
     void refresh() throws SQLException {
         LocalDate today = LocalDate.now(clock);
-        Map<Long, Long> todaySecondsByTask = reviewService.loadDay(today).entries().stream()
-                .collect(Collectors.toMap(entry -> entry.task().id(), DayReview.Entry::seconds));
         active = timer.active();
-        List<WorkTask> recentTasks = timer.recentTasks();
         timerDate = today;
         date.setText(today.format(SHORT_DATE));
         boolean isRunning = active != null;
@@ -434,19 +482,49 @@ public final class DesktopApplication extends Application {
         pause.setDisable(!isRunning);
         updateClock();
         updateMiniTimer();
-        showRecentTasks(recentTasks, todaySecondsByTask);
+        loadRecentTasks(today);
         refreshReview();
+        updateAutoSyncStatus();
     }
 
-    private void showRecentTasks(List<WorkTask> recentTasks, Map<Long, Long> todaySecondsByTask) {
+    private void loadRecentTasks(LocalDate day) {
+        if (recentLoad != null) {
+            recentLoad.cancel();
+        }
+        long revision = ++recentRevision;
+        recentLoad = background(() -> {
+            ReviewService.Overview overview = reviewService.loadOverview(day);
+            Map<Long, Long> seconds = overview.review().entries().stream()
+                    .collect(Collectors.toMap(entry -> entry.task().id(), DayReview.Entry::seconds));
+            return new RecentSnapshot(timer.recentTasks(), seconds, overview.bindings());
+        }, snapshot -> {
+            if (revision == recentRevision) {
+                recentLoad = null;
+                showRecentTasks(snapshot.tasks(), snapshot.seconds(), snapshot.bindings());
+            }
+        }, failure -> {
+            if (revision == recentRevision) {
+                recentLoad = null;
+                recent.getChildren().setAll(label("无法读取最近事项，请稍后重试。", "timer-empty", "wrap"));
+            }
+        });
+    }
+
+    private record RecentSnapshot(List<WorkTask> tasks, Map<Long, Long> seconds, Map<Long, Binding> bindings) {}
+
+    private void showRecentTasks(List<WorkTask> recentTasks, Map<Long, Long> todaySecondsByTask,
+                                 Map<Long, Binding> bindings) {
         recent.getChildren().clear();
         List<WorkTask> visibleTasks = recentTasks.stream()
                 .filter(task -> active == null || task.id() != active.task().id())
                 .limit(4)
                 .toList();
+        Map<String, Long> titleCounts = visibleTasks.stream()
+                .collect(Collectors.groupingBy(WorkTask::title, Collectors.counting()));
         for (WorkTask task : visibleTasks) {
             long todaySeconds = todaySecondsByTask.getOrDefault(task.id(), 0L);
-            recent.getChildren().add(createRecentTaskRow(task, todaySeconds));
+            recent.getChildren().add(createRecentTaskRow(task, todaySeconds, bindings.get(task.id()),
+                    titleCounts.get(task.title()) > 1));
         }
         if (recent.getChildren().isEmpty()) {
             Label empty = label("计时结束后，可从这里再次开始该事项。", "timer-empty", "wrap");
@@ -454,21 +532,26 @@ public final class DesktopApplication extends Application {
         }
     }
 
-    private HBox createRecentTaskRow(WorkTask task, long todaySeconds) {
+    private HBox createRecentTaskRow(WorkTask task, long todaySeconds, Binding binding, boolean repeatedTitle) {
         String duration = DayReview.duration(todaySeconds);
         Label total = label(duration, "recent-total");
         total.setMinWidth(Region.USE_PREF_SIZE);
 
-        Button startTask = button(task.title(), "recent");
+        String context = binding == null ? "本地事项" : binding.label();
+        String title = repeatedTitle ? task.title() + " · " + context : task.title();
+        Button startTask = button(title, "recent");
         StackPane playIcon = new StackPane(icon("M3.5 2.5 L9 6 L3.5 9.5 Z"));
         playIcon.getStyleClass().add("recent-play");
         startTask.setGraphic(playIcon);
         startTask.setGraphicTextGap(9);
-        startTask.setAccessibleText(task.title() + "，今日累计 " + duration);
-        startTask.setTooltip(new Tooltip("开始计时：" + task.title()));
+        startTask.setAccessibleText(title + "，今日累计 " + duration);
+        startTask.setTooltip(new Tooltip(binding == null ? task.title() : task.title() + "\n" + context));
         startTask.setMinWidth(0);
         startTask.setMaxWidth(Double.MAX_VALUE);
-        startTask.setOnAction(event -> begin(task.title()));
+        startTask.setOnAction(event -> perform(timerStage, () -> {
+            timer.start(task.id());
+            taskStarted();
+        }));
         HBox.setHgrow(startTask, Priority.ALWAYS);
 
         MenuItem removeFromRecent = new MenuItem("从最近事项移除");
@@ -506,6 +589,9 @@ public final class DesktopApplication extends Application {
         prompt.getDialogPane().lookupButton(delete).getStyleClass().add("danger");
         if (prompt.showAndWait().filter(delete::equals).isPresent()) {
             perform(owner, () -> {
+                if (autoSyncTask != null && autoSync.isAutomaticTask(task.id())) {
+                    throw new IllegalArgumentException("云效正在同步，请在同步结束后删除该事项。");
+                }
                 timer.deleteTask(task.id());
                 refresh();
             });
@@ -518,11 +604,113 @@ public final class DesktopApplication extends Application {
 
     private void startTask(String title) throws SQLException {
         timer.start(title);
-        taskInput.clear();
-        refresh();
+        taskStarted();
     }
 
-    private void refreshReview() throws SQLException {
+    private void startCloudTask(Window owner, String title, Consumer<Boolean> onClosed) throws SQLException {
+        yunxiao.startTimer(owner, timer, LocalDate.now(clock), title, started -> {
+            if (started) {
+                perform(owner, this::taskStarted);
+            }
+            onClosed.accept(started);
+        });
+    }
+
+    private void taskStarted() throws SQLException {
+        taskInput.clear();
+        refresh();
+        requestAutoSync();
+    }
+
+    void requestAutoSync() throws SQLException {
+        requestAutoSync(null);
+    }
+
+    private void requestAutoSync(PendingEffort confirmedRetry) throws SQLException {
+        if (autoSyncTask != null) {
+            autoSyncAgain = true;
+            return;
+        }
+        if (autoSync.pendingCount() == 0) {
+            return;
+        }
+        YunxiaoService connection = yunxiaoSettings.currentConnection();
+        if (connection == null) {
+            updateAutoSyncStatus();
+            return;
+        }
+        Task<YunxiaoAutoSync.Failure> sync = new Task<>() {
+            @Override
+            protected YunxiaoAutoSync.Failure call() throws SQLException, InterruptedException {
+                return autoSync.sync(connection, confirmedRetry);
+            }
+        };
+        sync.setOnSucceeded(event -> finishAutoSync(sync.getValue(), null));
+        sync.setOnFailed(event -> finishAutoSync(null, sync.getException()));
+        autoSyncTask = sync;
+        Thread.startVirtualThread(sync);
+        updateAutoSyncStatus();
+    }
+
+    private void finishAutoSync(YunxiaoAutoSync.Failure failure, Throwable error) {
+        autoSyncTask = null;
+        autoSyncFailure = failure;
+        autoSyncError = failure == null ? error : failure.cause();
+        boolean again = autoSyncAgain;
+        autoSyncAgain = false;
+        perform(timerStage, () -> {
+            refresh();
+            if (again) {
+                requestAutoSync();
+            }
+        });
+    }
+
+    private void updateAutoSyncStatus() throws SQLException {
+        int pending = autoSync.pendingCount();
+        boolean syncing = autoSyncTask != null;
+        cloudSync.setVisible(syncing || pending > 0);
+        cloudSync.setDisable(syncing);
+        cloudSync.setText(syncing ? "云效同步中…" : "待同步 " + pending + " · 重试");
+        if (pending == 0) {
+            autoSyncFailure = null;
+            autoSyncError = null;
+        }
+        String detail = autoSyncError == null ? "待同步记录会保存在本机。"
+                : YunxiaoDialogs.errorText(autoSyncError);
+        if (autoSyncError instanceof YunxiaoService.ManualEffortRequired) {
+            detail += " 可在收工页的「云效工时」中处理。";
+        }
+        cloudSync.setTooltip(new Tooltip(detail));
+    }
+
+    void retryAutoSync(Window owner) throws SQLException {
+        if (autoSyncTask != null || autoSync.pendingCount() == 0) {
+            return;
+        }
+        if (yunxiaoSettings.currentConnection() == null) {
+            yunxiao.configure(owner);
+        }
+        PendingEffort confirmedRetry = null;
+        if (autoSyncFailure != null && autoSyncFailure.cause() instanceof YunxiaoService.UncertainWrite) {
+            PendingEffort effort = autoSyncFailure.effort();
+            ButtonType confirm = new ButtonType("已核对，重试", ButtonBar.ButtonData.OK_DONE);
+            Alert prompt = new Alert(Alert.AlertType.CONFIRMATION,
+                    "请在云效核对「" + effort.title() + "」的子任务和 " + effort.day()
+                            + " 的工时。确认上次写入未成功后再重试。", confirm, ButtonType.CANCEL);
+            prompt.initOwner(owner);
+            prompt.setTitle("核对云效写入");
+            prompt.setHeaderText("上次云效写入结果待确认");
+            styleDialog(prompt, 440);
+            if (prompt.showAndWait().orElse(ButtonType.CANCEL) != confirm) {
+                return;
+            }
+            confirmedRetry = effort;
+        }
+        requestAutoSync(confirmedRetry);
+    }
+
+    private void refreshReview() {
         if (review != null && review.isShowing()) {
             review.refresh();
         }
@@ -530,10 +718,15 @@ public final class DesktopApplication extends Application {
 
     private void updateClock() {
         long seconds = active == null ? 0 : Math.max(0, timer.now() - active.start());
-        String display = clockDisplay(seconds);
-        elapsed.pseudoClassStateChanged(LONG_TIME, display.length() > 8);
-        elapsed.setText(display);
-        dial.update(seconds, active != null);
+        if (displayedSeconds != seconds) {
+            displayedSeconds = seconds;
+            String display = clockDisplay(seconds);
+            elapsed.pseudoClassStateChanged(LONG_TIME, display.length() > 8);
+            elapsed.setText(display);
+        }
+        if (!timerStage.isIconified()) {
+            dial.update(seconds, active != null);
+        }
     }
 
     private void updateMiniTimer() {

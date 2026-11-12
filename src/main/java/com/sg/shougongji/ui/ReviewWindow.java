@@ -7,18 +7,22 @@ import com.sg.shougongji.model.Yunxiao.Binding;
 import com.sg.shougongji.service.ReviewService;
 import com.sg.shougongji.service.TimerService;
 import javafx.beans.binding.Bindings;
+import javafx.concurrent.Task;
 import javafx.css.PseudoClass;
 import javafx.geometry.Pos;
+import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
 import javafx.scene.control.CheckBox;
 import javafx.scene.control.ComboBox;
+import javafx.scene.control.ContentDisplay;
 import javafx.scene.control.DatePicker;
 import javafx.scene.control.Dialog;
 import javafx.scene.control.Label;
+import javafx.scene.control.ListCell;
+import javafx.scene.control.ListView;
 import javafx.scene.control.RadioButton;
-import javafx.scene.control.ScrollPane;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TitledPane;
@@ -41,17 +45,24 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
+import static com.sg.shougongji.ui.UiSupport.appScene;
+import static com.sg.shougongji.ui.UiSupport.background;
 import static com.sg.shougongji.ui.UiSupport.bindSave;
 import static com.sg.shougongji.ui.UiSupport.button;
 import static com.sg.shougongji.ui.UiSupport.clockDisplay;
 import static com.sg.shougongji.ui.UiSupport.field;
 import static com.sg.shougongji.ui.UiSupport.form;
 import static com.sg.shougongji.ui.UiSupport.formatTime;
-import static com.sg.shougongji.ui.UiSupport.glassScene;
 import static com.sg.shougongji.ui.UiSupport.icon;
 import static com.sg.shougongji.ui.UiSupport.label;
 import static com.sg.shougongji.ui.UiSupport.parseTime;
@@ -73,8 +84,11 @@ final class ReviewWindow {
     private final Clock clock;
     private final Stage timerStage;
     private final Stage stage = new Stage();
-    private final VBox timeline = new VBox();
-    private final VBox summary = new VBox();
+    private final StackPane layers = new StackPane();
+    private final HBox layout;
+    private final ListView<DayReview.Segment> timeline = new ListView<>();
+    private final ListView<DayReview.Entry> summary = new ListView<>();
+    private final Set<Long> expandedTasks = new HashSet<>();
     private final Label total = label("", "metric");
     private final Label taskCount = label("", "stat-value");
     private final Label segmentCount = label("", "stat-value");
@@ -83,10 +97,18 @@ final class ReviewWindow {
     private final Label status = label("", "muted", "wrap");
     private final Label activeNotice = label("", "notice");
     private final DatePicker date;
+    private final Button add = button("补录时间段", "secondary");
     private final Button copy = button("复制清单", "primary");
 
     private DayReview review;
+    private Task<ReviewService.Overview> loadRequest;
+    private ReviewService.Overview displayedOverview;
+    private long reviewRevision;
+    private long runningTaskId = -1;
+    private EffortOverlay effortOverlay;
+    private Node focusBeforeEffort;
     private Map<Long, Binding> cloudBindings = Map.of();
+    private Set<Long> cloudPending = Set.of();
 
     ReviewWindow(DesktopApplication app, TimerService timer, ReviewService reviewService, Clock clock,
                  Stage timerStage, YunxiaoDialogs yunxiao) {
@@ -115,36 +137,52 @@ final class ReviewWindow {
             if (value == null) {
                 date.setValue(old);
             } else {
-                perform(stage, this::refresh);
+                refresh();
             }
         });
         stage.setTitle("收工页 · 收工记");
-        HBox root = content();
-        Scene scene = glassScene(root, 920, 620);
+        layout = content();
+        layers.getChildren().add(layout);
+        Scene scene = appScene(layers, 920, 620);
         app.addWindowShortcuts(scene);
         scene.widthProperty().addListener((property, previous, width) ->
-                root.pseudoClassStateChanged(NARROW, width.doubleValue() < 720));
+                layout.pseudoClassStateChanged(NARROW, width.doubleValue() < 720));
         scene.heightProperty().addListener((property, previous, height) ->
-                root.pseudoClassStateChanged(COMPACT, height.doubleValue() < 560));
+                layout.pseudoClassStateChanged(COMPACT, height.doubleValue() < 560));
         stage.setScene(scene);
         stage.setMinWidth(620);
         stage.setMinHeight(410);
-        stage.setOnHidden(event -> timerStage.setAlwaysOnTop(true));
+        stage.setOnCloseRequest(event -> {
+            if (effortOverlay != null && effortOverlay.isBusy()) {
+                event.consume();
+            }
+        });
+        stage.setOnHidden(event -> {
+            if (effortOverlay != null) {
+                effortOverlay.close();
+            }
+            cancelLoad();
+            timerStage.setAlwaysOnTop(true);
+        });
         stage.iconifiedProperty().addListener((property, previous, minimized) ->
                 timerStage.setAlwaysOnTop(minimized || !stage.isShowing()));
     }
 
-    void show() throws SQLException {
-        refresh();
+    void show() {
         timerStage.setAlwaysOnTop(false);
         stage.show();
         stage.setIconified(false);
         stage.toFront();
         stage.requestFocus();
+        refresh();
     }
 
     boolean isShowing() {
         return stage.isShowing();
+    }
+
+    boolean isEffortOpen() {
+        return effortOverlay != null && stage.isShowing() && !stage.isIconified();
     }
 
     private HBox content() {
@@ -200,7 +238,10 @@ final class ReviewWindow {
         Button cloudSettings = button("云效设置", "sidebar-link");
         cloudSettings.setGraphic(icon("M1.5 9 A3 3 0 0 1 4.5 6 A3.7 3.7 0 0 1 11.5 6.5 A2.5 2.5 0 0 1 11 11.5 H4 A2.5 2.5 0 0 1 1.5 9"));
         cloudSettings.setMaxWidth(Double.MAX_VALUE);
-        cloudSettings.setOnAction(event -> perform(stage, () -> yunxiao.configure(stage)));
+        cloudSettings.setOnAction(event -> perform(stage, () -> {
+            yunxiao.configure(stage);
+            app.requestAutoSync();
+        }));
         Region sidebarGap = new Region();
         VBox.setVgrow(sidebarGap, Priority.ALWAYS);
         StackPane brandIcon = new StackPane(icon(CLOCK_ICON));
@@ -245,17 +286,16 @@ final class ReviewWindow {
     }
 
     private VBox createRecordsPanel(RadioButton timelineTab, RadioButton summaryTab) {
-        Button add = button("补录时间段", "secondary");
         add.setGraphic(icon("M7 2 V12 M2 7 H12"));
         add.setOnAction(event -> perform(stage, () -> editSession(null)));
         copy.setOnAction(event -> copyList());
-        ScrollPane timelineView = scroll(timeline);
-        timelineView.visibleProperty().bind(timelineTab.selectedProperty());
-        timelineView.managedProperty().bind(timelineView.visibleProperty());
-        ScrollPane summaryView = scroll(summary);
-        summaryView.visibleProperty().bind(summaryTab.selectedProperty());
-        summaryView.managedProperty().bind(summaryView.visibleProperty());
-        StackPane records = new StackPane(timelineView, summaryView);
+        configureList(timeline, this::segmentCard);
+        configureList(summary, entry -> entryCard(entry, entry.task().id() == runningTaskId));
+        timeline.visibleProperty().bind(timelineTab.selectedProperty());
+        timeline.managedProperty().bind(timeline.visibleProperty());
+        summary.visibleProperty().bind(summaryTab.selectedProperty());
+        summary.managedProperty().bind(summary.visibleProperty());
+        StackPane records = new StackPane(timeline, summary);
         VBox.setVgrow(records, Priority.ALWAYS);
         Label listTitle = label("", "panel-title");
         listTitle.textProperty().bind(Bindings.when(timelineTab.selectedProperty())
@@ -275,10 +315,58 @@ final class ReviewWindow {
         return column;
     }
 
-    void refresh() throws SQLException {
-        ReviewService.Overview overview = reviewService.loadOverview(date.getValue());
+    void refresh() {
+        LocalDate requestedDay = date.getValue();
+        cancelLoad();
+        long revision = reviewRevision;
+        if (review == null || !requestedDay.equals(review.date())) {
+            displayedOverview = null;
+            expandedTasks.clear();
+            add.setDisable(true);
+            copy.setDisable(true);
+            activeNotice.setVisible(false);
+            total.setText("—");
+            estimatedTime.setVisible(false);
+            taskCount.setText("—");
+            segmentCount.setText("—");
+            unassignedCount.setText("—");
+            timeline.getItems().clear();
+            summary.getItems().clear();
+            timeline.setPlaceholder(label("正在读取记录…", "muted"));
+            summary.setPlaceholder(label("正在读取记录…", "muted"));
+            status.setText("");
+        }
+        loadRequest = background(() -> reviewService.loadOverview(requestedDay), overview -> {
+            if (revision == reviewRevision) {
+                loadRequest = null;
+                render(overview);
+            }
+        }, failure -> {
+            if (revision == reviewRevision) {
+                loadRequest = null;
+                status.setText("无法读取收工记录，请重新选择日期后重试。");
+                timeline.setPlaceholder(label("读取失败", "muted"));
+                summary.setPlaceholder(label("读取失败", "muted"));
+            }
+        });
+    }
+
+    private void cancelLoad() {
+        reviewRevision++;
+        if (loadRequest != null) {
+            loadRequest.cancel();
+            loadRequest = null;
+        }
+    }
+
+    private void render(ReviewService.Overview overview) {
+        if (overview.equals(displayedOverview)) {
+            return;
+        }
+        displayedOverview = overview;
         review = overview.review();
         cloudBindings = overview.bindings();
+        cloudPending = overview.pendingEffortTasks();
         long seconds = review.seconds();
         total.setText(clockDisplay(seconds));
         total.setAccessibleText(DayReview.duration(seconds));
@@ -291,23 +379,19 @@ final class ReviewWindow {
         unassignedCount.setText(Long.toString(unassigned));
 
         WorkSession active = overview.activeSession();
-        long until = date.getValue().plusDays(1).atStartOfDay(clock.getZone()).toEpochSecond();
-        boolean showNotice = active != null && active.start() < until && !date.getValue().isAfter(LocalDate.now(clock));
+        runningTaskId = active == null ? -1 : active.task().id();
+        long until = review.date().plusDays(1).atStartOfDay(clock.getZone()).toEpochSecond();
+        boolean showNotice = active != null && active.start() < until && !review.date().isAfter(LocalDate.now(clock));
         activeNotice.setVisible(showNotice);
         if (showNotice) {
             activeNotice.setText("「" + active.task().title() + "」正在计时，结束后计入本日汇总。");
         }
 
-        timeline.getChildren().setAll(review.segments().stream().map(this::segmentCard).toList());
-        summary.getChildren().setAll(review.entries().stream().map(entry -> entryCard(entry,
-                active != null && active.task().id() == entry.task().id())).toList());
-        if (review.segments().isEmpty()) {
-            timeline.getChildren().add(emptyRecords());
-            summary.getChildren().add(emptyRecords());
-        } else {
-            timeline.getChildren().getLast().pseudoClassStateChanged(LAST_RECORD, true);
-            summary.getChildren().getLast().pseudoClassStateChanged(LAST_RECORD, true);
-        }
+        timeline.setPlaceholder(emptyRecords());
+        summary.setPlaceholder(emptyRecords());
+        timeline.getItems().setAll(review.segments());
+        summary.getItems().setAll(review.entries());
+        add.setDisable(false);
         copy.setDisable(review.entries().isEmpty());
         status.setText("工作时区  " + clock.getZone().getId());
     }
@@ -338,45 +422,16 @@ final class ReviewWindow {
     private TitledPane entryCard(DayReview.Entry entry, boolean timing) {
         WorkTask task = entry.task();
         Binding binding = cloudBindings.get(task.id());
+        boolean pending = cloudPending.contains(task.id());
         String workItem = workItem(task);
         String relation = workItem.isBlank() ? "待归属" : workItem;
-        Button link = button(binding != null ? "手动关联…"
-                : task.workItem().isBlank() ? "关联工作项" : "编辑工作项", "secondary");
-        link.setOnAction(event -> editWorkItem(task));
-        Button sync = button(binding == null ? "关联已有云效任务…" : "云效工时…",
-                binding == null ? "secondary" : "primary");
-        sync.setOnAction(event -> perform(stage, () -> {
-            yunxiao.show(stage, entry, review.date(), binding);
-            refresh();
-        }));
-        Button delete = button("删除事项…", "subtle");
-        delete.setAccessibleText("删除 " + task.title());
-        delete.setDisable(timing);
-        delete.setOnAction(event -> app.confirmDeleteTask(stage, task));
-        FlowPane actions = new FlowPane(8, 6, sync, link, delete);
-        if (binding == null) {
-            Button create = button("新建云效任务…", "primary");
-            create.setOnAction(event -> perform(stage, () -> {
-                yunxiao.create(stage, entry, review.date());
-                refresh();
-            }));
-            actions.getChildren().addFirst(create);
-        }
-        VBox details = new VBox(8, label(relation, "muted", "wrap"), actions);
-        for (DayReview.Segment segment : entry.segments()) {
-            VBox detail = new VBox(3, label(timeRange(segment) + "  ·  " + segmentDetails(segment), "note", "wrap"));
-            detail.getStyleClass().add("entry-segment");
-            if (!segment.session().note().isBlank()) {
-                detail.getChildren().add(label(segment.session().note(), "muted", "wrap"));
-            }
-            details.getChildren().add(detail);
-        }
-        TitledPane pane = new TitledPane("", details);
+        LocalDate entryDate = review.date();
+        TitledPane pane = new TitledPane();
         Label title = label(task.title(), "section-title");
         title.setMinWidth(0);
         Label meta = label(entry.segments().size() + " 段"
                 + (entry.estimatedSeconds() == 0 ? "" : "  ·  含估算")
-                + (workItem.isBlank() ? "  ·  待归属" : ""), "muted");
+                + (pending ? "  ·  云效待同步" : workItem.isBlank() ? "  ·  待归属" : ""), "muted");
         meta.setMinWidth(0);
         VBox description = new VBox(3, title, meta);
         description.setMinWidth(0);
@@ -389,10 +444,98 @@ final class ReviewWindow {
         pane.setGraphic(heading);
         pane.setMinWidth(0);
         pane.setAccessibleText(task.title() + "，" + duration.getText() + "，" + meta.getText());
-        pane.setTooltip(new Tooltip(task.title()));
-        pane.setExpanded(false);
         pane.setAnimated(false);
+        pane.setExpanded(expandedTasks.contains(task.id()));
+        if (pane.isExpanded()) {
+            pane.setContent(entryDetails(entry, entryDate, timing, binding, pending, relation));
+        }
+        pane.expandedProperty().addListener((observable, previous, expanded) -> {
+            if (expanded) {
+                expandedTasks.add(task.id());
+                if (pane.getContent() == null) {
+                    pane.setContent(entryDetails(entry, entryDate, timing, binding, pending, relation));
+                }
+            } else {
+                expandedTasks.remove(task.id());
+            }
+        });
         return pane;
+    }
+
+    private VBox entryDetails(DayReview.Entry entry, LocalDate entryDate, boolean timing, Binding binding,
+                              boolean pending, String relation) {
+        WorkTask task = entry.task();
+        Runnable refreshAfterEdit = () -> perform(stage, app::refresh);
+        Consumer<Binding> showAfterBinding = newBinding -> perform(stage, () -> {
+            app.refresh();
+            showEffort(entry, entryDate, newBinding, refreshAfterEdit);
+        });
+        Button link = button(binding != null ? "手动关联…"
+                : task.workItem().isBlank() ? "关联工作项" : "编辑工作项", "secondary");
+        link.setOnAction(event -> editWorkItem(task));
+        Button sync = button(binding == null ? pending ? "重试云效同步" : "关联已有云效任务…" : "云效工时…",
+                binding == null ? "secondary" : "primary");
+        sync.setOnAction(event -> perform(stage, () -> {
+            if (binding != null) {
+                showEffort(entry, entryDate, binding, refreshAfterEdit);
+            } else if (pending) {
+                app.retryAutoSync(stage);
+            } else {
+                yunxiao.associate(stage, entry, entryDate, showAfterBinding);
+            }
+        }));
+        Button delete = button("删除事项…", "subtle");
+        delete.setAccessibleText("删除 " + task.title());
+        delete.setDisable(timing);
+        delete.setOnAction(event -> app.confirmDeleteTask(stage, task));
+        FlowPane actions = new FlowPane(8, 6, sync, link, delete);
+        if (binding == null && pending) {
+            Button recover = button("关联已创建的子任务…", "secondary");
+            recover.setOnAction(event -> perform(stage, () -> yunxiao.linkAutomaticChild(stage, entry, entryDate,
+                    () -> perform(stage, () -> {
+                        app.refresh();
+                        app.requestAutoSync();
+                    }))));
+            actions.getChildren().add(1, recover);
+        } else if (binding == null) {
+            Button create = button("新建云效任务…", "primary");
+            create.setOnAction(event -> perform(stage, () -> yunxiao.create(stage, entry, entryDate, showAfterBinding)));
+            actions.getChildren().addFirst(create);
+        }
+        VBox details = new VBox(8, label(relation, "muted", "wrap"), actions);
+        for (DayReview.Segment segment : entry.segments()) {
+            VBox detail = new VBox(3, label(timeRange(segment) + "  ·  " + segmentDetails(segment), "note", "wrap"));
+            detail.getStyleClass().add("entry-segment");
+            if (!segment.session().note().isBlank()) {
+                detail.getChildren().add(label(segment.session().note(), "muted", "wrap"));
+            }
+            details.getChildren().add(detail);
+        }
+        return details;
+    }
+
+    private void showEffort(DayReview.Entry entry, LocalDate entryDate, Binding binding, Runnable onChanged)
+            throws SQLException {
+        if (effortOverlay != null) {
+            return;
+        }
+        EffortOverlay panel = yunxiao.effortOverlay(stage, entry, entryDate, binding, this::closeEffort, onChanged);
+        if (panel != null) {
+            focusBeforeEffort = stage.getScene().getFocusOwner();
+            effortOverlay = panel;
+            layout.setDisable(true);
+            layers.getChildren().add(panel);
+        }
+    }
+
+    private void closeEffort(EffortOverlay panel) {
+        layers.getChildren().remove(panel);
+        effortOverlay = null;
+        layout.setDisable(false);
+        if (focusBeforeEffort != null && focusBeforeEffort.getScene() == stage.getScene()) {
+            focusBeforeEffort.requestFocus();
+        }
+        focusBeforeEffort = null;
     }
 
     private String timeRange(DayReview.Segment segment) {
@@ -401,7 +544,7 @@ final class ReviewWindow {
     }
 
     private String endTime(DayReview.Segment segment) {
-        long dayEnd = date.getValue().plusDays(1).atStartOfDay(clock.getZone()).toEpochSecond();
+        long dayEnd = review.date().plusDays(1).atStartOfDay(clock.getZone()).toEpochSecond();
         return (segment.end() == dayEnd ? "次日 " : "")
                 + TIME.format(Instant.ofEpochSecond(segment.end()).atZone(clock.getZone()));
     }
@@ -413,8 +556,27 @@ final class ReviewWindow {
     }
 
     private void editSession(WorkSession original) throws SQLException {
+        List<WorkTask> tasks = timer.tasks();
+        Map<String, Long> titleCounts = tasks.stream()
+                .collect(Collectors.groupingBy(WorkTask::title, Collectors.counting()));
+        Map<String, WorkTask> choices = new LinkedHashMap<>();
+        String originalChoice = original == null ? "" : original.task().title();
+        for (WorkTask option : tasks) {
+            String name = option.title();
+            if (titleCounts.get(name) > 1) {
+                String context = workItem(option);
+                name += " · " + (context.isBlank() ? "本地事项" : context);
+            }
+            while (choices.containsKey(name)) {
+                name += " · " + option.id();
+            }
+            choices.put(name, option);
+            if (original != null && option.id() == original.task().id()) {
+                originalChoice = name;
+            }
+        }
         ComboBox<String> task = new ComboBox<>();
-        task.getItems().setAll(timer.tasks().stream().map(WorkTask::title).toList());
+        task.getItems().setAll(choices.keySet());
         task.setEditable(true);
         task.setMaxWidth(Double.MAX_VALUE);
         task.setPromptText("选择已有事项，或输入新事项");
@@ -427,7 +589,7 @@ final class ReviewWindow {
         CheckBox estimated = new CheckBox("这段时间是估算");
         LocalDate selected = date.getValue();
         if (original != null) {
-            task.setValue(original.task().title());
+            task.setValue(originalChoice);
             start.setText(formatTime(original.start(), clock.getZone()));
             end.setText(formatTime(original.end(), clock.getZone()));
             note.setText(original.note());
@@ -448,7 +610,13 @@ final class ReviewWindow {
                     ? Instant.ofEpochSecond(original.start()) : parseTime(start.getText(), clock.getZone(), selected);
             Instant to = original != null && end.getText().equals(formatTime(original.end(), clock.getZone()))
                     ? Instant.ofEpochSecond(original.end()) : parseTime(end.getText(), clock.getZone(), selected);
-            timer.saveSession(original, task.getEditor().getText(), from, to, note.getText(), estimated.isSelected());
+            String title = task.getEditor().getText();
+            WorkTask chosen = choices.get(title);
+            if (chosen == null) {
+                timer.saveSession(original, title, from, to, note.getText(), estimated.isSelected());
+            } else {
+                timer.saveSession(original, chosen.id(), chosen.title(), from, to, note.getText(), estimated.isSelected());
+            }
         });
         if (dialog.showAndWait().filter(dialog.getDialogPane().getButtonTypes().getFirst()::equals).isPresent()) {
             app.refresh();
@@ -475,16 +643,30 @@ final class ReviewWindow {
 
     private String workItem(WorkTask task) {
         Binding binding = cloudBindings.get(task.id());
-        return binding == null ? task.workItem() : "云效 · " + binding.label();
+        if (binding != null) {
+            return "云效 · " + binding.label();
+        }
+        return cloudPending.contains(task.id()) ? "云效 · 子任务待创建" : task.workItem();
     }
 
-    private static ScrollPane scroll(VBox items) {
-        items.getStyleClass().add("review-records");
-        ScrollPane scroll = new ScrollPane(items);
-        scroll.setFitToWidth(true);
-        scroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
-        scroll.setMinHeight(0);
-        return scroll;
+    private static <T> void configureList(ListView<T> list, Function<T, Region> createCard) {
+        list.getStyleClass().add("review-records");
+        list.setMinHeight(0);
+        list.setCellFactory(view -> new ListCell<>() {
+            @Override
+            protected void updateItem(T item, boolean empty) {
+                super.updateItem(item, empty);
+                setContentDisplay(ContentDisplay.GRAPHIC_ONLY);
+                if (empty || item == null) {
+                    setGraphic(null);
+                } else {
+                    Region card = createCard.apply(item);
+                    card.prefWidthProperty().bind(Bindings.max(0, widthProperty().subtract(2)));
+                    card.pseudoClassStateChanged(LAST_RECORD, getIndex() == view.getItems().size() - 1);
+                    setGraphic(card);
+                }
+            }
+        });
     }
 
     private static VBox emptyRecords() {

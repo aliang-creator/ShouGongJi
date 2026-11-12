@@ -1,7 +1,7 @@
 package com.sg.shougongji.ui;
 
 import javafx.event.ActionEvent;
-import javafx.scene.CacheHint;
+import javafx.concurrent.Task;
 import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.control.Alert;
@@ -11,11 +11,9 @@ import javafx.scene.control.ButtonType;
 import javafx.scene.control.Dialog;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
-import javafx.scene.effect.GaussianBlur;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
-import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.shape.SVGPath;
 import javafx.stage.Window;
@@ -31,6 +29,8 @@ import java.time.format.DateTimeParseException;
 import java.time.format.ResolverStyle;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.Callable;
+import java.util.function.Consumer;
 
 final class UiSupport {
     static final String STYLES = UiSupport.class.getResource("shougongji.css").toExternalForm();
@@ -41,18 +41,24 @@ final class UiSupport {
 
     private UiSupport() {}
 
-    static Scene glassScene(Region content, double width, double height) {
-        Region wash = new Region();
-        wash.getStyleClass().add("window-wash");
-        wash.setMouseTransparent(true);
-        wash.setEffect(new GaussianBlur(30));
-        wash.setCache(true);
-        wash.setCacheHint(CacheHint.QUALITY);
-        StackPane root = new StackPane(wash, content);
-        root.getStyleClass().add("work-window");
-        Scene scene = new Scene(root, width, height);
+    static Scene appScene(Region content, double width, double height) {
+        content.getStyleClass().add("work-window");
+        Scene scene = new Scene(content, width, height);
         scene.getStylesheets().add(STYLES);
         return scene;
+    }
+
+    static <T> Task<T> background(Callable<T> action, Consumer<T> done, Consumer<Throwable> failed) {
+        Task<T> task = new Task<>() {
+            @Override
+            protected T call() throws Exception {
+                return action.call();
+            }
+        };
+        task.setOnSucceeded(event -> done.accept(task.getValue()));
+        task.setOnFailed(event -> failed.accept(task.getException()));
+        Thread.startVirtualThread(task);
+        return task;
     }
 
     static SVGPath icon(String path) {

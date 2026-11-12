@@ -7,11 +7,13 @@ import com.google.gson.JsonPrimitive;
 import com.sg.shougongji.AppServices;
 import com.sg.shougongji.model.Yunxiao.ApiException;
 import com.sg.shougongji.model.Yunxiao.Binding;
+import com.sg.shougongji.model.Yunxiao.ChildDraft;
 import com.sg.shougongji.model.Yunxiao.Choice;
 import com.sg.shougongji.model.Yunxiao.Field;
 import com.sg.shougongji.model.Yunxiao.Item;
 import com.sg.shougongji.model.Yunxiao.Page;
 import com.sg.shougongji.model.Yunxiao.PendingWrite;
+import com.sg.shougongji.model.Yunxiao.WorkItemKind;
 import com.sg.shougongji.repository.WorkLogDatabase;
 import com.sg.shougongji.repository.YunxiaoRepository;
 import com.sg.shougongji.service.TimerService;
@@ -30,7 +32,9 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +49,244 @@ import static org.junit.jupiter.api.Assertions.*;
 class YunxiaoServiceTest {
     @TempDir
     Path directory;
+
+    @Test
+    void searchesSubtasksByTitleOrNumberWithinTheProject() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoService sync = new YunxiaoService(open(), cloud.central());
+        String items = """
+                [{"id":"task-12","subject":"导出超时","serialNumber":"PRJ-12","categoryId":"Task",
+                  "space":{"id":"project-1"},"parentId":"req-1","workitemType":{"id":"task-type"}},
+                 {"id":"task-11","subject":"导出任务","serialNumber":"PRJ-11","categoryId":"Task",
+                  "space":{"id":"project-1"},"parentId":null}]
+                """;
+        cloud.answer("POST", "/workitems:search", request -> {
+            JsonObject query = body(request);
+            assertEquals("project-1", query.get("spaceId").getAsString());
+            assertEquals("Task", query.get("category").getAsString());
+            JsonObject filter = JsonParser.parseString(query.get("conditions").getAsString()).getAsJsonObject()
+                    .getAsJsonArray("conditionGroups").get(0).getAsJsonArray().get(0).getAsJsonObject();
+            assertEquals("subject", filter.get("fieldIdentifier").getAsString());
+            assertEquals("导出", filter.getAsJsonArray("value").get(0).getAsString());
+            return response(request, 200, items);
+        });
+        List<Item> matches = sync.timerItems("project-1", WorkItemKind.SUBTASK, " 导出 ", 1).items();
+        assertEquals(1, matches.size());
+        Item task = matches.getFirst();
+        assertEquals("req-1", task.parentId());
+
+        cloud.answer("POST", "/workitems:search", request -> new Response(request, 200, "[]",
+                HttpHeaders.of(Map.of("x-next-page", List.of("2")), (name, value) -> true)));
+        cloud.answer("POST", "/workitems:search", request -> {
+            assertEquals(2, body(request).get("page").getAsInt());
+            return response(request, 200, items);
+        });
+        assertEquals(new Page<>(List.of(task), 0), sync.timerItems("project-1", WorkItemKind.SUBTASK, "prj-12", 1));
+        cloud.assertDone();
+    }
+
+    @Test
+    void separatesRequirementsAndIndependentTasksAndSkipsPagesOfSubtasks() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoService sync = new YunxiaoService(open(), cloud.central());
+        String subtask = """
+                [{"id":"task-12","categoryId":"Task","space":{"id":"project-1"},"parentId":"req-1"}]
+                """;
+        cloud.answer("POST", "/workitems:search", request -> {
+            assertEquals("Req", body(request).get("category").getAsString());
+            return response(request, 200, """
+                    [{"id":"req-1","categoryId":"Req","space":{"id":"project-1"}},
+                     {"id":"req-2","categoryId":"Req","space":{"id":"other-project"}}]
+                    """);
+        });
+        assertEquals(List.of("req-1"), sync.timerItems("project-1", WorkItemKind.REQUIREMENT, "", 1)
+                .items().stream().map(Item::id).toList());
+
+        cloud.answer("POST", "/workitems:search", request -> {
+            JsonObject query = body(request);
+            assertEquals("Task", query.get("category").getAsString());
+            assertEquals(1, query.get("page").getAsInt());
+            return new Response(request, 200, subtask,
+                    HttpHeaders.of(Map.of("x-next-page", List.of("2")), (name, value) -> true));
+        });
+        cloud.answer("POST", "/workitems:search", request -> {
+            assertEquals(2, body(request).get("page").getAsInt());
+            return new Response(request, 200, """
+                    [{"id":"task-10","categoryId":"Task","space":{"id":"project-1"}},
+                     {"id":"task-11","categoryId":"Task","space":{"id":"project-1"},"parentId":"req-1"}]
+                    """, HttpHeaders.of(Map.of("x-next-page", List.of("3")), (name, value) -> true));
+        });
+        Page<Item> independent = sync.timerItems("project-1", WorkItemKind.INDEPENDENT_TASK, "", 1);
+        assertEquals(List.of("task-10"), independent.items().stream().map(Item::id).toList());
+        assertEquals(3, independent.next());
+
+        cloud.answer("POST", "/workitems:search", request -> {
+            assertEquals(3, body(request).get("page").getAsInt());
+            return response(request, 200, subtask);
+        });
+        assertEquals(new Page<Item>(List.of(), 0),
+                sync.timerItems("project-1", WorkItemKind.INDEPENDENT_TASK, "", independent.next()));
+        cloud.assertDone();
+    }
+
+    @Test
+    void createsChildAfterFirstStopAndUpdatesTheSameDailyEffortAfterResuming() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoClient client = cloud.central();
+        Choice project = new Choice("project-1", "项目");
+        Item parent = new Item("task-1", "PRJ-1", "订单导出", "task-type", project.id(), "Task", "", "");
+        Instant start = Instant.parse("2026-11-12T01:00:00Z");
+        AppServices services = servicesAt(start);
+        TimerService timer = services.timer();
+        String title = "排查导出超时";
+        timer.start(title);
+        var local = timer.active().task();
+        YunxiaoService sync = new YunxiaoService(open(), client);
+        ChildDraft draft = new ChildDraft(project, parent, "task-type", title, "member-1", "", Map.of());
+        long firstChild = sync.prepareAutomaticChild(draft);
+        timer.start(firstChild);
+        assertNotEquals(local.id(), firstChild);
+        assertEquals(title, timer.active().task().title());
+        assertNull(open().findBinding(firstChild));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+        cloud.assertDone();
+
+        Instant firstEnd = start.plusSeconds(40 * 60);
+        services = servicesAt(firstEnd);
+        timer = services.timer();
+        timer.pause(timer.active().id(), firstEnd, false);
+        cloud.answer("POST", "/workitems", request -> {
+            JsonObject requestBody = body(request);
+            assertEquals(parent.id(), requestBody.get("parentId").getAsString());
+            assertEquals(title, requestBody.get("subject").getAsString());
+            assertEquals("", requestBody.get("description").getAsString());
+            return response(request, 503, "{}");
+        });
+        var failure = services.yunxiaoAutoSync().sync(sync, null);
+        assertInstanceOf(ApiException.class, failure.cause());
+        assertEquals(1, services.yunxiaoAutoSync().pendingCount());
+        assertNull(timer.active());
+
+        cloud.answer("GET", "/workitems/task-1/relationRecords?relationType=SUB",
+                "[{\"resourceType\":\"WORKITEM\",\"resourceId\":\"child-1\"}]");
+        cloud.answer("GET", "/workitems/child-1", request -> response(request, 200, new Gson().toJson(Map.of(
+                "id", "child-1", "categoryId", "Task", "parentId", parent.id(), "subject", title,
+                "space", Map.of("id", project.id()), "description", ""))));
+        YunxiaoService reopened = new YunxiaoService(open(), client);
+        Instant secondStart = start.plusSeconds(3600);
+        services = servicesAt(secondStart);
+        assertInstanceOf(YunxiaoService.UncertainWrite.class, services.yunxiaoAutoSync().sync(reopened, null).cause());
+        assertEquals(1, services.yunxiaoAutoSync().pendingCount());
+        Item first = new Item("child-1", "PRJ-3", title, "task-type", project.id(), "Task", parent.id(), "");
+        Item unrelated = new Item("other-1", "PRJ-4", title, "task-type", project.id(), "Task", "wrong-parent", "");
+        assertThrows(IllegalArgumentException.class, () -> reopened.bindAutomaticChild(firstChild, unrelated));
+        reopened.bindAutomaticChild(firstChild, first);
+        cloud.answer("POST", "/workitems/child-1/effortRecords", request -> {
+            assertEquals(new BigDecimal("0.67"), body(request).get("actualTime").getAsBigDecimal());
+            return response(request, 201, "{\"id\":\"effort-1\"}");
+        });
+        assertNull(services.yunxiaoAutoSync().sync(reopened, null));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        assertEquals("child-1", open().findBinding(firstChild).childId());
+
+        Item otherParent = new Item("req-2", "PRJ-2", "批量导出", "req-type", project.id(), "Req", "", "");
+        long secondChild = reopened.prepareAutomaticChild(
+                new ChildDraft(project, otherParent, "task-type", title, "member-1", "", Map.of()));
+        assertNotEquals(firstChild, secondChild);
+        assertEquals(firstChild, reopened.timerTask(project, first));
+        assertEquals(firstChild, reopened.prepareAutomaticChild(draft));
+        services.timer().start(firstChild);
+        Instant secondEnd = secondStart.plusSeconds(20 * 60);
+        services = servicesAt(secondEnd);
+        services.timer().pause(services.timer().active().id(), secondEnd, false);
+        cloud.answer("PUT", "/workitems/child-1/effortRecords/effort-1", request -> {
+            assertEquals(new BigDecimal("1.00"), body(request).get("actualTime").getAsBigDecimal());
+            return response(request, 204, "");
+        });
+        assertNull(services.yunxiaoAutoSync().sync(reopened, null));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        assertNull(open().findBinding(secondChild));
+        cloud.assertDone();
+    }
+
+    @Test
+    void switchingAfterMidnightQueuesSeparateDaysForTheOriginalOrganization() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoService sync = new YunxiaoService(open(), cloud.central());
+        Choice project = new Choice("project-1", "项目");
+        Item parent = new Item("req-1", "PRJ-1", "订单导出", "req-type", project.id(), "Req", "", "");
+        long taskId = sync.prepareAutomaticChild(
+                new ChildDraft(project, parent, "task-type", "修复导出", "member-1", " \n", Map.of()));
+        Instant start = Instant.parse("2026-11-12T23:45:00Z");
+        AppServices services = servicesAt(start);
+        services.timer().start(taskId);
+        services.timer().pause(services.timer().active().id(), start, false);
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        services.timer().start(taskId);
+        services = servicesAt(start.plusSeconds(30 * 60));
+        services.timer().start("本地事项");
+        assertEquals(2, services.yunxiaoAutoSync().pendingCount());
+        YunxiaoService wrongOrganization = new YunxiaoService(open(), new YunxiaoClient("", "org-2", "test-token",
+                request -> fail("Queued work must stay in its original organization")));
+        assertNull(services.yunxiaoAutoSync().sync(wrongOrganization, null));
+        assertEquals(2, services.yunxiaoAutoSync().pendingCount());
+
+        cloud.answer("POST", "/workitems", request -> {
+            assertEquals("", body(request).get("description").getAsString());
+            return response(request, 201, "{\"id\":\"child-1\"}");
+        });
+        for (String day : List.of("2026-11-12", "2026-11-13")) {
+            cloud.answer("POST", "/workitems/child-1/effortRecords", request -> {
+                JsonObject effort = body(request);
+                assertEquals(day, effort.get("gmtStart").getAsString());
+                assertEquals(day, effort.get("gmtEnd").getAsString());
+                assertEquals(new BigDecimal("0.25"), effort.get("actualTime").getAsBigDecimal());
+                return response(request, 201, "{\"id\":\"effort-" + day + "\"}");
+            });
+        }
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        assertEquals("本地事项", services.timer().active().task().title());
+        cloud.assertDone();
+    }
+
+    @Test
+    void finishingAnotherSegmentDuringUploadKeepsTheNewTotalQueued() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoService sync = new YunxiaoService(open(), cloud.central());
+        Choice project = new Choice("project-1", "项目");
+        Item parent = new Item("req-1", "PRJ-1", "订单导出", "req-type", project.id(), "Req", "", "");
+        long taskId = sync.prepareAutomaticChild(
+                new ChildDraft(project, parent, "task-type", "修复导出", "member-1", "", Map.of()));
+        Instant start = Instant.parse("2026-11-12T01:00:00Z");
+        servicesAt(start).timer().start(taskId);
+        Instant end = start.plusSeconds(15 * 60);
+        AppServices services = servicesAt(end);
+        services.timer().pause(services.timer().active().id(), end, false);
+
+        cloud.answer("POST", "/workitems", "{\"id\":\"child-1\"}");
+        cloud.answer("POST", "/workitems/child-1/effortRecords", request -> {
+            assertEquals(new BigDecimal("0.25"), body(request).get("actualTime").getAsBigDecimal());
+            assertDoesNotThrow(() -> {
+                servicesAt(end).timer().start(taskId);
+                Instant secondEnd = end.plusSeconds(30 * 60);
+                TimerService timer = servicesAt(secondEnd).timer();
+                timer.pause(timer.active().id(), secondEnd, false);
+            });
+            return response(request, 201, "{\"id\":\"effort-1\"}");
+        });
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+        assertEquals(1, services.yunxiaoAutoSync().pendingCount());
+
+        cloud.answer("PUT", "/workitems/child-1/effortRecords/effort-1", request -> {
+            assertEquals(new BigDecimal("0.75"), body(request).get("actualTime").getAsBigDecimal());
+            return response(request, 204, "");
+        });
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        cloud.assertDone();
+    }
 
     @Test
     void createsChildInSelectedProjectAndUpdatesTheSameDailyEffort() throws Exception {
@@ -83,12 +325,14 @@ class YunxiaoServiceTest {
                 client.taskTypes(project.id(), parent.typeId()));
 
         LocalDate date = LocalDate.of(2026, 11, 7);
+        String description = "## 验收\n核对工时  \n\n";
         cloud.answer("POST", "/workitems", request -> {
             JsonObject body = body(request);
             assertEquals(project.id(), body.get("spaceId").getAsString());
             assertEquals(parent.id(), body.get("parentId").getAsString());
             assertEquals("allowed", body.get("workitemTypeId").getAsString());
             assertEquals("member-1", body.get("assignedTo").getAsString());
+            assertEquals(description, body.get("description").getAsString());
             assertEquals("p1", body.getAsJsonObject("customFieldValues").get("priority").getAsString());
             assertEquals(date + " 00:00:00", body.getAsJsonObject("customFieldValues").get("79").getAsString());
             assertEquals(date + " 23:59:59", body.getAsJsonObject("customFieldValues").get("80").getAsString());
@@ -97,7 +341,7 @@ class YunxiaoServiceTest {
         YunxiaoService sync = new YunxiaoService(repository, client);
         Field start = new Field("79", "计划开始时间", "SystemCustomField", "date", "", false, List.of());
         Field end = new Field("80", "计划完成时间", "SystemCustomField", "date", "", false, List.of());
-        Binding binding = sync.create(task, project, parent, "allowed", "本地事项", "member-1",
+        Binding binding = sync.create(task, project, parent, "allowed", "本地事项", "member-1", description,
                 Map.of("priority", "p1", start.id(), start.plannedDate(date), end.id(), end.plannedDate(date)), false);
         assertEquals(binding, open().findBindings().get(task));
 
@@ -134,7 +378,7 @@ class YunxiaoServiceTest {
     }
 
     @Test
-    void createsAnIndependentTaskAndRecoversItFromTheSelectedProject() throws Exception {
+    void recoversAnIndependentTaskCreatedWithALegacyMarker() throws Exception {
         Cloud cloud = new Cloud();
         YunxiaoClient client = cloud.central();
         YunxiaoRepository repository = open();
@@ -150,21 +394,8 @@ class YunxiaoServiceTest {
         assertEquals(List.of(new Choice("task-type", "开发任务"), new Choice("other", "其他")),
                 client.taskTypes(project.id()));
         String description = "## 验收\n核对工时";
-        ArrayDeque<String> descriptions = new ArrayDeque<>();
-        cloud.answer("POST", "/workitems", request -> {
-            JsonObject body = body(request);
-            assertEquals(project.id(), body.get("spaceId").getAsString());
-            assertFalse(body.has("parentId"));
-            assertEquals("MARKDOWN", body.get("formatType").getAsString());
-            assertEquals("p2", body.getAsJsonObject("customFieldValues").get("priority").getAsString());
-            String sentDescription = body.get("description").getAsString();
-            assertTrue(sentDescription.startsWith(description + "\n\n收工记#"));
-            descriptions.add(sentDescription);
-            return response(request, 503, "{}");
-        });
-        assertThrows(ApiException.class,
-                () -> sync.create(task, project, null, "task-type", "独立任务", "member-1", description,
-                        Map.of("priority", "p2"), false));
+        PendingWrite legacy = repository.reserveWrite(task, sync.scope(), "project-task:" + project.id());
+        String legacyDescription = description + "\n\n" + legacy.marker();
 
         cloud.answer("POST", "/workitems:search", request -> {
             JsonObject body = body(request);
@@ -172,14 +403,14 @@ class YunxiaoServiceTest {
             assertEquals(project.id(), body.get("spaceId").getAsString());
             assertEquals(1, body.get("page").getAsInt());
             Map<String, Object> nestedTask = Map.of("id", "nested", "parentId", "req", "categoryId", "Task",
-                    "space", Map.of("id", project.id()), "description", descriptions.getFirst());
+                    "space", Map.of("id", project.id()), "description", legacyDescription);
             return new Response(request, 200, new Gson().toJson(List.of(nestedTask)),
                     HttpHeaders.of(Map.of("x-next-page", List.of("2")), (name, value) -> true));
         });
         cloud.answer("POST", "/workitems:search", request -> {
             assertEquals(2, body(request).get("page").getAsInt());
             Map<String, Object> independentTask = Map.of("id", "independent", "categoryId", "Task",
-                    "space", Map.of("id", project.id()), "description", descriptions.getFirst());
+                    "space", Map.of("id", project.id()), "description", legacyDescription);
             return response(request, 200, new Gson().toJson(List.of(independentTask)));
         });
         Binding binding = new YunxiaoService(open(), client).create(task, project, null, "task-type", "独立任务",
@@ -389,6 +620,10 @@ class YunxiaoServiceTest {
 
     private Path database() {
         return directory.resolve("worklog.sqlite");
+    }
+
+    private AppServices servicesAt(Instant instant) throws Exception {
+        return AppServices.open(database(), Clock.fixed(instant, ZoneOffset.UTC));
     }
 
     private long task() throws Exception {

@@ -8,6 +8,7 @@ import com.sg.shougongji.repository.TimerRepository;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 
 public final class TimerService {
@@ -54,21 +55,26 @@ public final class TimerService {
     }
 
     public void start(String title) throws SQLException {
-        repository.inTransaction(mapper -> {
-            long startedAt = now();
-            WorkSession activeSession = mapper.findActiveSession();
-            long taskId = findOrCreateTaskId(mapper, title);
-            if (activeSession != null && activeSession.task().id() == taskId) {
-                return;
-            }
-            if (activeSession != null) {
-                // 切换时用同一时刻结束旧计时、开始新计时，两个写入一起提交。
-                finishSession(mapper, activeSession, startedAt, false);
-            }
-            ensureNoOverlap(mapper, NO_SESSION_ID, startedAt, Long.MAX_VALUE);
-            mapper.insertActiveSession(taskId, startedAt);
-            mapper.showInRecent(taskId);
-        });
+        repository.inTransaction(mapper -> start(mapper, findOrCreateTaskId(mapper, title)));
+    }
+
+    public void start(long taskId) throws SQLException {
+        repository.inTransaction(mapper -> start(mapper, requireTask(mapper, taskId)));
+    }
+
+    private void start(TimerMapper mapper, long taskId) {
+        long startedAt = now();
+        WorkSession activeSession = mapper.findActiveSession();
+        if (activeSession != null && activeSession.task().id() == taskId) {
+            return;
+        }
+        if (activeSession != null) {
+            // 切换时用同一时刻结束旧计时、开始新计时，两个写入一起提交。
+            finishSession(mapper, activeSession, startedAt, false);
+        }
+        ensureNoOverlap(mapper, NO_SESSION_ID, startedAt, Long.MAX_VALUE);
+        mapper.insertActiveSession(taskId, startedAt);
+        mapper.showInRecent(taskId);
     }
 
     public void pause(long sessionId, Instant end, boolean estimated) throws SQLException {
@@ -87,6 +93,13 @@ public final class TimerService {
 
     public void saveSession(WorkSession original, String title, Instant start, Instant end, String note, boolean estimated)
             throws SQLException {
+        Long existingTask = original != null && original.task().title().equals(title.strip())
+                ? original.task().id() : null;
+        saveSession(original, existingTask, title, start, end, note, estimated);
+    }
+
+    public void saveSession(WorkSession original, Long existingTask, String title,
+                            Instant start, Instant end, String note, boolean estimated) throws SQLException {
         long startedAt = start.getEpochSecond();
         long endedAt = end.getEpochSecond();
         if (startedAt >= endedAt || endedAt > now()) {
@@ -97,7 +110,7 @@ public final class TimerService {
             // 编辑时排除原计时段，避免拿新时间和这条记录自身比较。
             long sessionIdToIgnore = isNewSession ? NO_SESSION_ID : original.id();
             ensureNoOverlap(mapper, sessionIdToIgnore, startedAt, endedAt);
-            long taskId = findOrCreateTaskId(mapper, title);
+            long taskId = existingTask == null ? findOrCreateTaskId(mapper, title) : requireTask(mapper, existingTask);
             String normalizedNote = note.strip();
             int affectedRows;
             if (isNewSession) {
@@ -119,7 +132,7 @@ public final class TimerService {
         repository.inTransaction(mapper -> mapper.updateWorkItem(taskId, value.strip()));
     }
 
-    private static void finishSession(TimerMapper mapper, WorkSession session, long endedAt, boolean estimated) {
+    private void finishSession(TimerMapper mapper, WorkSession session, long endedAt, boolean estimated) {
         if (endedAt < session.start()) {
             throw new IllegalArgumentException("结束时间不能早于开始时间。");
         }
@@ -128,6 +141,18 @@ public final class TimerService {
             mapper.deleteSession(session.id());
         } else {
             mapper.finishSession(session.id(), endedAt, estimated);
+            enqueueEffort(mapper, session.task().id(), session.start(), endedAt);
+        }
+    }
+
+    private void enqueueEffort(TimerMapper mapper, long taskId, long startedAt, long endedAt) {
+        if (!mapper.automaticallyRegistersEffort(taskId)) {
+            return;
+        }
+        LocalDate firstDay = Instant.ofEpochSecond(startedAt).atZone(clock.getZone()).toLocalDate();
+        LocalDate lastDay = Instant.ofEpochSecond(endedAt - 1).atZone(clock.getZone()).toLocalDate();
+        for (LocalDate day = firstDay; !day.isAfter(lastDay); day = day.plusDays(1)) {
+            mapper.enqueueEffort(taskId, day.toString());
         }
     }
 
@@ -147,6 +172,13 @@ public final class TimerService {
         Long taskId = mapper.findTaskId(normalizedTitle);
         if (taskId == null) {
             throw new SQLException("无法读取事项");
+        }
+        return taskId;
+    }
+
+    private static long requireTask(TimerMapper mapper, long taskId) {
+        if (!mapper.taskExists(taskId)) {
+            throw new IllegalArgumentException("该事项已删除，请重新选择。");
         }
         return taskId;
     }

@@ -40,6 +40,15 @@
         </constructor>
     </resultMap>
 
+    <resultMap id="pendingEffort" type="com.sg.shougongji.model.Yunxiao$PendingEffort">
+        <constructor>
+            <arg column="task_id" javaType="_long"/>
+            <arg column="day" javaType="string"/>
+            <arg column="revision" javaType="string"/>
+            <arg column="display_title" javaType="string"/>
+        </constructor>
+    </resultMap>
+
     <select id="findConnection" resultMap="connection">
         SELECT instance, organization_id, access_token FROM yunxiao_connection WHERE id = 1
     </select>
@@ -73,6 +82,72 @@
     <select id="findBindings" resultMap="taskBinding">
         SELECT task_id, scope, child_id, label FROM yunxiao_binding
     </select>
+
+    <select id="findBinding" resultMap="binding">
+        SELECT scope, child_id, label FROM yunxiao_binding WHERE task_id = #{taskId}
+    </select>
+
+    <select id="findTaskForItem" resultType="long">
+        SELECT task_id FROM yunxiao_binding
+        WHERE scope = #{binding.scope} AND child_id = #{binding.childId}
+        ORDER BY task_id LIMIT 1
+    </select>
+
+    <select id="findChildTimerTask" resultType="long">
+        SELECT task_id FROM yunxiao_timer_task
+        WHERE scope = #{scope} AND parent_id = #{parentId} AND display_title = #{title}
+    </select>
+
+    <select id="insertTimerTask" resultType="long" affectData="true" flushCache="true">
+        INSERT INTO task (title) VALUES (#{key}) RETURNING id
+    </select>
+
+    <insert id="saveTimerTitle">
+        INSERT INTO yunxiao_timer_task (task_id, scope, parent_id, display_title)
+        VALUES (#{taskId}, #{scope}, #{parentId,jdbcType=VARCHAR}, #{title})
+    </insert>
+
+    <insert id="saveChildDraft">
+        INSERT INTO yunxiao_auto_task (task_id, draft) VALUES (#{taskId}, #{draft})
+        ON CONFLICT (task_id) DO UPDATE SET draft = excluded.draft
+    </insert>
+
+    <select id="findChildDraft" resultType="string">
+        SELECT a.draft FROM yunxiao_auto_task a JOIN yunxiao_timer_task t ON t.task_id = a.task_id
+        WHERE a.task_id = #{taskId}
+        <if test="scope != null">
+            AND t.scope = #{scope}
+        </if>
+    </select>
+
+    <sql id="pendingEffortWithTask">
+        SELECT e.task_id, e.day, e.revision, t.display_title
+        FROM yunxiao_auto_effort e JOIN yunxiao_timer_task t ON t.task_id = e.task_id
+    </sql>
+
+    <select id="findPendingEfforts" resultMap="pendingEffort">
+        <include refid="pendingEffortWithTask"/>
+        WHERE t.scope = #{scope}
+        ORDER BY e.day, e.task_id
+    </select>
+
+    <select id="findPendingEffort" resultMap="pendingEffort">
+        <include refid="pendingEffortWithTask"/>
+        WHERE e.task_id = #{taskId} AND e.day = #{day}
+    </select>
+
+    <select id="pendingEffortCount" resultType="int">
+        SELECT COUNT(*) FROM yunxiao_auto_effort
+    </select>
+
+    <select id="pendingEffortTasks" resultType="long">
+        SELECT task_id FROM yunxiao_auto_effort WHERE day = #{day}
+    </select>
+
+    <delete id="completePendingEffort">
+        DELETE FROM yunxiao_auto_effort
+        WHERE task_id = #{effort.taskId} AND day = #{effort.day} AND revision = #{effort.revision}
+    </delete>
 
     <insert id="saveBinding">
         INSERT INTO yunxiao_binding (task_id, scope, child_id, label)

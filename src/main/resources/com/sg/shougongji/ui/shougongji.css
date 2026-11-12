@@ -34,12 +34,7 @@
 .panel-title { -fx-font-size: 17px; -fx-font-weight: bold; }
 .page-title { -fx-font-size: 30px; -fx-font-weight: bold; }
 
-.work-window { -fx-background-color: #edf0f5; }
-.window-wash {
-    -fx-background-color:
-        radial-gradient(center 50% 12%, radius 76%, #ffffff 0%, #ffffff66 57%, #ffffff00 100%),
-        radial-gradient(center 94% 72%, radius 78%, #dce4f0 0%, #dce4f066 63%, #dce4f000 100%);
-}
+.work-window { -fx-background-color: linear-gradient(to bottom right, #fbfcfe 0%, #edf1f8 55%, #dfe6f2 100%); }
 .timer-page { -fx-padding: 18 23 17; }
 .timer-heading { -fx-font-size: 21px; -fx-font-weight: bold; }
 .timer-date { -fx-text-fill: -sg-muted; -fx-font-size: 12px; }
@@ -49,7 +44,6 @@
         radial-gradient(center 38% 21%, radius 87%, #ffffff 0%, #f8faff 51%, #e2e8f3 100%);
     -fx-background-insets: 0, 1;
     -fx-background-radius: 110;
-    -fx-effect: dropshadow(gaussian, #2d3f6029, 23, 0.08, 0, 9);
 }
 .dial-track, .dial-minor-ticks, .dial-major-ticks, .dial-sweep {
     -fx-fill: transparent;
@@ -162,7 +156,6 @@
     -fx-background-radius: 19;
     -fx-border-color: #ffffff;
     -fx-border-radius: 19;
-    -fx-effect: dropshadow(gaussian, #34476518, 17, 0.1, 0, 5);
 }
 .review-time-emblem {
     -fx-min-width: 52;
@@ -172,7 +165,6 @@
     -fx-background-radius: 30;
     -fx-border-color: #ffffff;
     -fx-border-radius: 30;
-    -fx-effect: dropshadow(gaussian, #33476121, 9, 0.1, 0, 3);
 }
 .review-time-emblem .line-icon { -fx-stroke: #637a9d; }
 .review-metric-label { -fx-text-fill: -sg-muted; -fx-font-size: 12px; -fx-font-weight: 600; }
@@ -199,6 +191,10 @@
     -fx-background-radius: 14;
     -fx-border-color: #ffffffdb;
     -fx-border-radius: 14;
+}
+.review-records .list-cell {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
 }
 .review-empty {
     -fx-padding: 28 16;
@@ -482,6 +478,20 @@
 .dialog-pane:header .header-panel .label { -fx-font-size: 18px; -fx-font-weight: bold; }
 .dialog-pane > .content, .dialog-pane > .content.label { -fx-padding: 16 22; }
 .dialog-pane > .button-bar > .container { -fx-padding: 0 22 17; }
+.effort-overlay { -fx-background-color: #18243a29; }
+.effort-card {
+    -fx-background-color: #f7f8fc;
+    -fx-background-radius: 14;
+    -fx-border-color: #d2dbe9;
+    -fx-border-radius: 14;
+}
+.effort-title {
+    -fx-background-color: #e9eef7;
+    -fx-background-radius: 13 13 0 0;
+    -fx-padding: 10 18;
+}
+.effort-form { -fx-padding: 14 18 4; }
+.effort-footer { -fx-padding: 8 18 14; }
 .yunxiao-help > .tab-header-area { -fx-padding: 0 0 10; }
 .yunxiao-help > .tab-header-area > .tab-header-background { -fx-background-color: transparent; }
 .yunxiao-help .tab {

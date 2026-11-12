@@ -30,6 +30,26 @@ CREATE TABLE IF NOT EXISTS yunxiao_binding (
     label TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS yunxiao_timer_task (
+    task_id INTEGER PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE,
+    scope TEXT NOT NULL,
+    parent_id TEXT,
+    display_title TEXT NOT NULL,
+    UNIQUE (scope, parent_id, display_title)
+);
+
+CREATE TABLE IF NOT EXISTS yunxiao_auto_task (
+    task_id INTEGER PRIMARY KEY REFERENCES yunxiao_timer_task(task_id) ON DELETE CASCADE,
+    draft TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS yunxiao_auto_effort (
+    task_id INTEGER NOT NULL REFERENCES yunxiao_auto_task(task_id) ON DELETE CASCADE,
+    day TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    PRIMARY KEY (task_id, day)
+);
+
 CREATE TABLE IF NOT EXISTS yunxiao_connection (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     instance TEXT NOT NULL,

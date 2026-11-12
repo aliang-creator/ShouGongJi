@@ -13,6 +13,12 @@ public interface TimerMapper {
 
     Long findTaskId(@Param("title") String title);
 
+    boolean taskExists(@Param("taskId") long taskId);
+
+    boolean automaticallyRegistersEffort(@Param("taskId") long taskId);
+
+    void enqueueEffort(@Param("taskId") long taskId, @Param("day") String day);
+
     void updateWorkItem(@Param("taskId") long taskId, @Param("workItem") String workItem);
 
     void hideFromRecent(@Param("taskId") long taskId);

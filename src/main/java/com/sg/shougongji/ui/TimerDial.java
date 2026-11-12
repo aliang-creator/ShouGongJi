@@ -16,6 +16,8 @@ final class TimerDial extends StackPane {
     private static final double TRACK_RADIUS = CENTER - 9;
     private final Arc sweep = new Arc(CENTER, CENTER, TRACK_RADIUS, TRACK_RADIUS, 90, 0);
     private final Circle hand = new Circle(3);
+    private int lastSecond = -1;
+    private boolean lastRunning;
 
     TimerDial() {
         setMinSize(DIAMETER, DIAMETER);
@@ -43,6 +45,8 @@ final class TimerDial extends StackPane {
         sweep.setType(ArcType.OPEN);
         sweep.getStyleClass().add("dial-sweep");
         hand.getStyleClass().add("dial-hand");
+        sweep.setManaged(false);
+        hand.setManaged(false);
         Pane scale = new Pane(track, minorTicks, majorTicks, sweep, hand);
         scale.setMouseTransparent(true);
         getChildren().addAll(face, scale);
@@ -51,9 +55,17 @@ final class TimerDial extends StackPane {
 
     void update(long seconds, boolean running) {
         int second = (int) (seconds % 60);
+        if (second == lastSecond && running == lastRunning) {
+            return;
+        }
+        lastSecond = second;
+        lastRunning = running;
         sweep.setVisible(running && second > 0);
-        sweep.setLength(-6.0 * second);
         hand.setVisible(running);
+        if (!running) {
+            return;
+        }
+        sweep.setLength(-6.0 * second);
         double angle = second * Math.PI / 30;
         hand.setCenterX(CENTER + Math.sin(angle) * TRACK_RADIUS);
         hand.setCenterY(CENTER - Math.cos(angle) * TRACK_RADIUS);

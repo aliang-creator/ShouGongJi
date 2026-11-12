@@ -14,6 +14,7 @@ import com.sg.shougongji.model.Yunxiao.Item;
 import com.sg.shougongji.model.Yunxiao.Page;
 import com.sg.shougongji.model.Yunxiao.Planning;
 import com.sg.shougongji.model.Yunxiao.ProtocolException;
+import com.sg.shougongji.model.Yunxiao.WorkItemKind;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -33,6 +34,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 
 import static com.sg.shougongji.model.Yunxiao.PLAN_END_FIELD;
 import static com.sg.shougongji.model.Yunxiao.PLAN_START_FIELD;
@@ -41,6 +43,7 @@ public final class YunxiaoClient {
     public static final String CENTRAL_ENDPOINT = "https://openapi-rdc.aliyuncs.com";
     private static final Gson JSON = new Gson();
     private static final int PAGE_SIZE = 100;
+    private static final Pattern WORK_ITEM_NUMBER = Pattern.compile("[\\p{L}\\p{N}_-]+-[0-9]+");
 
     @FunctionalInterface
     interface Transport {
@@ -108,19 +111,64 @@ public final class YunxiaoClient {
     public Page<Item> projectTasks(String projectId, int page) throws IOException, InterruptedException {
         Page<Item> result = workItems(projectId, "Task", page);
         List<Item> tasks = result.items().stream()
-                .filter(item -> projectId.equals(item.projectId()) && item.parentId().isBlank()
-                        && "Task".equals(item.category()))
+                .filter(item -> projectId.equals(item.projectId()) && WorkItemKind.INDEPENDENT_TASK.matches(item))
                 .toList();
         return new Page<>(tasks, result.next());
     }
 
     private Page<Item> workItems(String projectId, String category, int page) throws IOException, InterruptedException {
-        return search("/workitems:search", Map.of("spaceId", id(projectId), "spaceType", "Project",
-                "category", category, "page", page, "perPage", PAGE_SIZE), page, YunxiaoClient::item);
+        return workItems(projectId, category, "", page);
     }
 
-    public List<Item> subtasks(String requirementId) throws IOException, InterruptedException {
-        List<JsonObject> relations = objects(request("GET", "/workitems/" + id(requirementId)
+    public Page<Item> timerItems(String projectId, WorkItemKind kind, String keyword, int page)
+            throws IOException, InterruptedException {
+        String query = keyword.strip();
+        if (page == 1 && WORK_ITEM_NUMBER.matcher(query).matches()) {
+            // 搜索接口返回编号。按项目翻页查找精确编号，标题查询使用文档支持的筛选条件。
+            int next = 1;
+            while (next > 0) {
+                Page<Item> result = searchTimerItems(projectId, kind, "", next);
+                Optional<Item> match = result.items().stream()
+                        .filter(item -> query.equalsIgnoreCase(item.serial()))
+                        .findFirst();
+                if (match.isPresent()) {
+                    return new Page<>(List.of(match.get()), 0);
+                }
+                next = result.next();
+            }
+        }
+        return searchTimerItems(projectId, kind, query, page);
+    }
+
+    private Page<Item> searchTimerItems(String projectId, WorkItemKind kind, String title, int page)
+            throws IOException, InterruptedException {
+        int next = page;
+        while (true) {
+            Page<Item> result = workItems(projectId, kind.category(), title, next);
+            List<Item> items = result.items().stream()
+                    .filter(item -> projectId.equals(item.projectId()) && kind.matches(item))
+                    .toList();
+            if (!items.isEmpty() || result.next() == 0) {
+                return new Page<>(items, result.next());
+            }
+            next = result.next();
+        }
+    }
+
+    private Page<Item> workItems(String projectId, String category, String title, int page)
+            throws IOException, InterruptedException {
+        Map<String, Object> query = new LinkedHashMap<>(Map.of("spaceId", id(projectId), "spaceType", "Project",
+                "category", category, "page", page, "perPage", PAGE_SIZE));
+        if (!title.isEmpty()) {
+            Map<String, Object> filter = Map.of("fieldIdentifier", "subject", "operator", "CONTAINS",
+                    "value", List.of(title), "className", "string", "format", "input");
+            query.put("conditions", JSON.toJson(Map.of("conditionGroups", List.of(List.of(filter)))));
+        }
+        return search("/workitems:search", query, page, YunxiaoClient::item);
+    }
+
+    public List<Item> subtasks(String parentId) throws IOException, InterruptedException {
+        List<JsonObject> relations = objects(request("GET", "/workitems/" + id(parentId)
                 + "/relationRecords?relationType=SUB", null).body());
         List<Item> children = new ArrayList<>();
         Set<String> seenChildIds = new HashSet<>();
@@ -131,7 +179,7 @@ public final class YunxiaoClient {
             String childId = requiredId(relation, "resourceId");
             if (seenChildIds.add(childId)) {
                 Item child = workItem(childId);
-                if ("Task".equals(child.category()) && requirementId.equals(child.parentId())) {
+                if ("Task".equals(child.category()) && parentId.equals(child.parentId())) {
                     children.add(child);
                 }
             }
@@ -186,7 +234,8 @@ public final class YunxiaoClient {
             throws IOException, InterruptedException {
         Map<String, Object> body = new LinkedHashMap<>(Map.of("spaceId", id(projectId),
                 "workitemTypeId", id(typeId), "subject", subject, "assignedTo", id(assignee),
-                "description", description, "formatType", "MARKDOWN", "customFieldValues", custom));
+                "description", description.isBlank() ? "" : description,
+                "formatType", "MARKDOWN", "customFieldValues", custom));
         if (parentId != null) {
             body.put("parentId", id(parentId));
         }

@@ -11,6 +11,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public final class ReviewService {
     private final TimerRepository timer;
@@ -31,8 +32,10 @@ public final class ReviewService {
     }
 
     public Overview loadOverview(LocalDate date) throws SQLException {
-        return new Overview(loadDay(date), yunxiao.findBindings(), timer.findActiveSession());
+        return new Overview(loadDay(date), yunxiao.findBindings(), timer.findActiveSession(),
+                yunxiao.pendingEffortTasks(date.toString()));
     }
 
-    public record Overview(DayReview review, Map<Long, Binding> bindings, WorkSession activeSession) {}
+    public record Overview(DayReview review, Map<Long, Binding> bindings, WorkSession activeSession,
+                           Set<Long> pendingEffortTasks) {}
 }

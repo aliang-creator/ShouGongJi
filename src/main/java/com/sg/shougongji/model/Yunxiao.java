@@ -7,6 +7,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Map;
 
 public final class Yunxiao {
     public static final String PLAN_START_FIELD = "79";
@@ -27,6 +28,11 @@ public final class Yunxiao {
 
     public record PendingWrite(String marker, String remoteId, boolean fresh) {}
 
+    public record ChildDraft(Choice project, Item parent, String typeId, String title, String assignee,
+                             String description, Map<String, String> fields) {}
+
+    public record PendingEffort(long taskId, String day, String revision, String title) {}
+
     public record Choice(String id, String name) {
         @Override
         public String toString() {
@@ -39,6 +45,30 @@ public final class Yunxiao {
         @Override
         public String toString() {
             return serial.isBlank() ? subject : serial + "  " + subject;
+        }
+    }
+
+    public enum WorkItemKind {
+        REQUIREMENT("Req"),
+        INDEPENDENT_TASK("Task"),
+        SUBTASK("Task");
+
+        private final String category;
+
+        WorkItemKind(String category) {
+            this.category = category;
+        }
+
+        public String category() {
+            return category;
+        }
+
+        public boolean matches(Item item) {
+            return category.equals(item.category()) && switch (this) {
+                case REQUIREMENT -> true;
+                case INDEPENDENT_TASK -> item.parentId().isBlank();
+                case SUBTASK -> !item.parentId().isBlank();
+            };
         }
     }
 
