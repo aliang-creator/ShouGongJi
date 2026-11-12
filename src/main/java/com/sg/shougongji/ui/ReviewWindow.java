@@ -1,6 +1,7 @@
 package com.sg.shougongji.ui;
 
 import com.sg.shougongji.model.DayReview;
+import com.sg.shougongji.model.WorkSchedule;
 import com.sg.shougongji.model.WorkSession;
 import com.sg.shougongji.model.WorkTask;
 import com.sg.shougongji.model.Yunxiao.Binding;
@@ -40,11 +41,16 @@ import javafx.scene.shape.SVGPath;
 import javafx.stage.Stage;
 import javafx.util.StringConverter;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.time.format.ResolverStyle;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -62,15 +68,15 @@ import static com.sg.shougongji.ui.UiSupport.button;
 import static com.sg.shougongji.ui.UiSupport.clockDisplay;
 import static com.sg.shougongji.ui.UiSupport.field;
 import static com.sg.shougongji.ui.UiSupport.form;
-import static com.sg.shougongji.ui.UiSupport.formatTime;
 import static com.sg.shougongji.ui.UiSupport.icon;
 import static com.sg.shougongji.ui.UiSupport.label;
-import static com.sg.shougongji.ui.UiSupport.parseTime;
 import static com.sg.shougongji.ui.UiSupport.perform;
 import static com.sg.shougongji.ui.UiSupport.spacer;
 
 final class ReviewWindow {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final DateTimeFormatter WORK_TIME = DateTimeFormatter.ofPattern("H:mm")
+            .withResolverStyle(ResolverStyle.STRICT);
     private static final DateTimeFormatter DAY = DateTimeFormatter.ofPattern("uuuu年M月d日", Locale.SIMPLIFIED_CHINESE);
     private static final String CLOCK_ICON = "M7 1 A6 6 0 1 1 7 13 A6 6 0 1 1 7 1 M7 3.5 V7 L9.5 8.5";
     private static final PseudoClass COMPACT = PseudoClass.getPseudoClass("compact");
@@ -97,7 +103,7 @@ final class ReviewWindow {
     private final Label status = label("", "muted", "wrap");
     private final Label activeNotice = label("", "notice");
     private final DatePicker date;
-    private final Button add = button("补录时间段", "secondary");
+    private final Button add = button("补录工时", "secondary");
     private final Button copy = button("复制清单", "primary");
 
     private DayReview review;
@@ -235,6 +241,14 @@ final class ReviewWindow {
         }
         timelineTab.setSelected(true);
 
+        Button weeklyEffort = button("本周云效工时", "sidebar-link");
+        weeklyEffort.setGraphic(icon("M2 4 H12 V12 H2 Z M2 6.5 H12 M5 2 V4 M9 2 V4 M5 9 H9"));
+        weeklyEffort.setMaxWidth(Double.MAX_VALUE);
+        weeklyEffort.setOnAction(event -> perform(stage, () -> yunxiao.showWeek(stage, LocalDate.now(clock))));
+        Button scheduleSettings = button("上班时段", "sidebar-link");
+        scheduleSettings.setGraphic(icon(CLOCK_ICON));
+        scheduleSettings.setMaxWidth(Double.MAX_VALUE);
+        scheduleSettings.setOnAction(event -> perform(stage, this::editWorkSchedule));
         Button cloudSettings = button("云效设置", "sidebar-link");
         cloudSettings.setGraphic(icon("M1.5 9 A3 3 0 0 1 4.5 6 A3.7 3.7 0 0 1 11.5 6.5 A2.5 2.5 0 0 1 11 11.5 H4 A2.5 2.5 0 0 1 1.5 9"));
         cloudSettings.setMaxWidth(Double.MAX_VALUE);
@@ -249,14 +263,14 @@ final class ReviewWindow {
         HBox brand = new HBox(9, brandIcon, label("收工记", "sidebar-title"));
         brand.setAlignment(Pos.CENTER_LEFT);
         brand.getStyleClass().add("review-brand");
-        VBox sidebar = new VBox(5, brand, timelineTab, summaryTab, sidebarGap, cloudSettings);
+        VBox sidebar = new VBox(5, brand, timelineTab, summaryTab, weeklyEffort, sidebarGap, scheduleSettings, cloudSettings);
         sidebar.getStyleClass().add("sidebar");
         return sidebar;
     }
 
     private HBox createOverview() {
         estimatedTime.managedProperty().bind(estimatedTime.visibleProperty());
-        VBox overviewMetric = new VBox(3, label("已结束工时", "review-metric-label"), total, estimatedTime);
+        VBox overviewMetric = new VBox(3, label("已记录工时", "review-metric-label"), total, estimatedTime);
         overviewMetric.setAlignment(Pos.CENTER_LEFT);
         overviewMetric.setMinWidth(0);
         HBox.setHgrow(overviewMetric, Priority.ALWAYS);
@@ -287,7 +301,7 @@ final class ReviewWindow {
 
     private VBox createRecordsPanel(RadioButton timelineTab, RadioButton summaryTab) {
         add.setGraphic(icon("M7 2 V12 M2 7 H12"));
-        add.setOnAction(event -> perform(stage, () -> editSession(null)));
+        add.setOnAction(event -> perform(stage, () -> editWorkHours(null)));
         copy.setOnAction(event -> copyList());
         configureList(timeline, this::segmentCard);
         configureList(summary, entry -> entryCard(entry, entry.task().id() == runningTaskId));
@@ -398,9 +412,6 @@ final class ReviewWindow {
 
     private HBox segmentCard(DayReview.Segment segment) {
         WorkSession session = segment.session();
-        Button edit = button("编辑", "subtle");
-        edit.setAccessibleText("编辑 " + session.task().title());
-        edit.setOnAction(event -> perform(stage, () -> editSession(session)));
         VBox times = new VBox(3, label(TIME.format(Instant.ofEpochSecond(segment.start()).atZone(clock.getZone())), "start-time"),
                 label("至 " + endTime(segment), "muted"));
         times.getStyleClass().add("timeline-times");
@@ -411,10 +422,9 @@ final class ReviewWindow {
         }
         details.setMinWidth(0);
         HBox.setHgrow(details, Priority.ALWAYS);
-        edit.setMinWidth(Region.USE_PREF_SIZE);
         Region marker = new Region();
         marker.getStyleClass().add("timeline-marker");
-        HBox card = new HBox(12, marker, times, details, edit);
+        HBox card = new HBox(12, marker, times, details, editHoursButton(session.task()));
         card.getStyleClass().add("segment-card");
         return card;
     }
@@ -438,7 +448,7 @@ final class ReviewWindow {
         HBox.setHgrow(description, Priority.ALWAYS);
         Label duration = label(DayReview.duration(entry.seconds()), "entry-duration");
         duration.setMinWidth(Region.USE_PREF_SIZE);
-        HBox heading = new HBox(12, description, duration);
+        HBox heading = new HBox(12, description, editHoursButton(task), duration);
         heading.setAlignment(Pos.CENTER_LEFT);
         heading.prefWidthProperty().bind(pane.widthProperty().subtract(54));
         pane.setGraphic(heading);
@@ -489,7 +499,11 @@ final class ReviewWindow {
         delete.setDisable(timing);
         delete.setOnAction(event -> app.confirmDeleteTask(stage, task));
         FlowPane actions = new FlowPane(8, 6, sync, link, delete);
-        if (binding == null && pending) {
+        if (binding != null) {
+            Button editStatus = button("云效状态…", "secondary");
+            editStatus.setOnAction(event -> perform(stage, () -> yunxiao.editStatus(stage, binding)));
+            actions.getChildren().add(1, editStatus);
+        } else if (pending) {
             Button recover = button("关联已创建的子任务…", "secondary");
             recover.setOnAction(event -> perform(stage, () -> yunxiao.linkAutomaticChild(stage, entry, entryDate,
                     () -> perform(stage, () -> {
@@ -497,7 +511,7 @@ final class ReviewWindow {
                         app.requestAutoSync();
                     }))));
             actions.getChildren().add(1, recover);
-        } else if (binding == null) {
+        } else {
             Button create = button("新建云效任务…", "primary");
             create.setOnAction(event -> perform(stage, () -> yunxiao.create(stage, entry, entryDate, showAfterBinding)));
             actions.getChildren().addFirst(create);
@@ -512,6 +526,18 @@ final class ReviewWindow {
             details.getChildren().add(detail);
         }
         return details;
+    }
+
+    private Button editHoursButton(WorkTask task) {
+        Button edit = button("编辑工时", "subtle");
+        edit.setMinWidth(Region.USE_PREF_SIZE);
+        edit.setAccessibleText("编辑当天工时，" + task.title());
+        edit.setOnAction(event -> perform(stage, () -> {
+            DayReview.Entry entry = review.entries().stream().filter(item -> item.task().id() == task.id())
+                    .findFirst().orElseThrow(() -> new IllegalArgumentException("该事项当天的记录已变更，请刷新后重试。"));
+            editWorkHours(entry);
+        }));
+        return edit;
     }
 
     private void showEffort(DayReview.Entry entry, LocalDate entryDate, Binding binding, Runnable onChanged)
@@ -555,12 +581,11 @@ final class ReviewWindow {
                 + (session.estimated() ? "  ·  估算" : "");
     }
 
-    private void editSession(WorkSession original) throws SQLException {
+    private Map<String, WorkTask> taskChoices() throws SQLException {
         List<WorkTask> tasks = timer.tasks();
         Map<String, Long> titleCounts = tasks.stream()
                 .collect(Collectors.groupingBy(WorkTask::title, Collectors.counting()));
         Map<String, WorkTask> choices = new LinkedHashMap<>();
-        String originalChoice = original == null ? "" : original.task().title();
         for (WorkTask option : tasks) {
             String name = option.title();
             if (titleCounts.get(name) > 1) {
@@ -571,55 +596,87 @@ final class ReviewWindow {
                 name += " · " + option.id();
             }
             choices.put(name, option);
-            if (original != null && option.id() == original.task().id()) {
-                originalChoice = name;
-            }
         }
+        return choices;
+    }
+
+    private void editWorkHours(DayReview.Entry original) throws SQLException {
+        Map<String, WorkTask> choices = original == null ? taskChoices() : Map.of();
         ComboBox<String> task = new ComboBox<>();
         task.getItems().setAll(choices.keySet());
         task.setEditable(true);
         task.setMaxWidth(Double.MAX_VALUE);
         task.setPromptText("选择已有事项，或输入新事项");
-        TextField start = new TextField();
-        TextField end = new TextField();
+        TextField hours = new TextField();
+        hours.setPromptText("例如 3 或 1.5");
         TextArea note = new TextArea();
         note.setPromptText("例如：定位到导出任务缺少权限");
         note.setPrefRowCount(3);
         note.setWrapText(true);
-        CheckBox estimated = new CheckBox("这段时间是估算");
+        CheckBox estimated = new CheckBox("工时为估算");
         LocalDate selected = date.getValue();
         if (original != null) {
-            task.setValue(originalChoice);
-            start.setText(formatTime(original.start(), clock.getZone()));
-            end.setText(formatTime(original.end(), clock.getZone()));
-            note.setText(original.note());
-            estimated.setSelected(original.estimated());
+            hours.setText(BigDecimal.valueOf(original.seconds()).divide(BigDecimal.valueOf(3600), 6, RoundingMode.HALF_UP)
+                    .stripTrailingZeros().toPlainString());
+            note.setText(String.join("\n", original.notes()));
+            estimated.setSelected(original.estimatedSeconds() > 0);
         }
-        start.setPromptText("例如 9:30");
-        end.setPromptText("例如 10:15");
-        VBox startField = field("开始时间", start);
-        VBox endField = field("结束时间", end);
-        HBox.setHgrow(startField, Priority.ALWAYS);
-        HBox.setHgrow(endField, Priority.ALWAYS);
-        VBox timeFields = new VBox(5, new HBox(10, startField, endField),
-                label("只填时分会记在 " + selected + "，跨日请填写日期。", "muted", "wrap"));
-        VBox fields = new VBox(12, field("事项", task), timeFields, field("备注或结果", note), estimated);
-        Dialog<ButtonType> dialog = form(stage, original == null ? "补录时间段" : "编辑时间段", fields, "保存");
+        VBox taskField = field("事项", original == null ? task : label(original.task().title(), "section-title", "wrap"));
+        VBox durationField = new VBox(5, field(original == null ? "补录工时（小时）" : "当天总工时（小时）", hours),
+                label(DAY.format(selected) + " · 按全天上班时段排时，跳过午休和已占用时间。", "muted", "wrap"));
+        VBox fields = new VBox(12, taskField, durationField, field("备注或结果", note), estimated);
+        Dialog<ButtonType> dialog = form(stage, original == null ? "补录工时" : "编辑工时", fields, "保存");
         bindSave(dialog, () -> {
-            Instant from = original != null && start.getText().equals(formatTime(original.start(), clock.getZone()))
-                    ? Instant.ofEpochSecond(original.start()) : parseTime(start.getText(), clock.getZone(), selected);
-            Instant to = original != null && end.getText().equals(formatTime(original.end(), clock.getZone()))
-                    ? Instant.ofEpochSecond(original.end()) : parseTime(end.getText(), clock.getZone(), selected);
-            String title = task.getEditor().getText();
-            WorkTask chosen = choices.get(title);
-            if (chosen == null) {
-                timer.saveSession(original, title, from, to, note.getText(), estimated.isSelected());
+            long seconds = parseHours(hours.getText());
+            if (original != null) {
+                timer.editWorkHours(selected, original, seconds, note.getText(), estimated.isSelected());
             } else {
-                timer.saveSession(original, chosen.id(), chosen.title(), from, to, note.getText(), estimated.isSelected());
+                String title = task.getEditor().getText().strip();
+                WorkTask chosen = choices.get(title);
+                timer.addWorkHours(selected, chosen == null ? null : chosen.id(), title, seconds,
+                        note.getText(), estimated.isSelected());
             }
         });
         if (dialog.showAndWait().filter(dialog.getDialogPane().getButtonTypes().getFirst()::equals).isPresent()) {
             app.refresh();
+        }
+    }
+
+    private static long parseHours(String text) {
+        String input = text.strip();
+        if (!input.matches("(?:[0-9]{1,2}(?:\\.[0-9]{1,6})?|\\.[0-9]{1,6})")) {
+            throw new IllegalArgumentException("请输入有效工时，例如 3 或 1.5 小时。");
+        }
+        return new BigDecimal(input).multiply(BigDecimal.valueOf(3600))
+                .setScale(0, RoundingMode.HALF_UP).longValueExact();
+    }
+
+    private void editWorkSchedule() throws SQLException {
+        WorkSchedule schedule = timer.workSchedule();
+        TextField morningStart = new TextField(clockTime(schedule.morningStart()));
+        TextField morningEnd = new TextField(clockTime(schedule.morningEnd()));
+        TextField afternoonStart = new TextField(clockTime(schedule.afternoonStart()));
+        TextField afternoonEnd = new TextField(clockTime(schedule.afternoonEnd()));
+        VBox fields = new VBox(12,
+                new HBox(10, field("上午上班", morningStart), field("上午下班", morningEnd)),
+                new HBox(10, field("下午上班", afternoonStart), field("下午下班", afternoonEnd)),
+                label("补录或编辑工时时，按这里设置的时段排时。", "muted", "wrap"));
+        Dialog<ButtonType> dialog = form(stage, "上班时段", fields, "保存");
+        bindSave(dialog, () -> timer.saveWorkSchedule(new WorkSchedule(parseWorkTime(morningStart.getText()),
+                parseWorkTime(morningEnd.getText()), parseWorkTime(afternoonStart.getText()),
+                parseWorkTime(afternoonEnd.getText()))));
+        dialog.showAndWait();
+    }
+
+    private static String clockTime(int minutes) {
+        return LocalTime.ofSecondOfDay(minutes * 60L).toString();
+    }
+
+    private static int parseWorkTime(String text) {
+        try {
+            return LocalTime.parse(text.strip().replace('.', ':'), WORK_TIME).toSecondOfDay() / 60;
+        } catch (DateTimeParseException invalid) {
+            throw new IllegalArgumentException("请输入有效时刻，例如 09:20 或 13:50。");
         }
     }
 
@@ -671,7 +728,7 @@ final class ReviewWindow {
 
     private static VBox emptyRecords() {
         VBox empty = new VBox(5, label("当天暂无记录", "section-title"),
-                label("完成计时或补录时间段后，记录会显示在这里。", "muted", "wrap"));
+                label("完成计时或补录工时后，记录会显示在这里。", "muted", "wrap"));
         empty.setAlignment(Pos.CENTER);
         empty.getStyleClass().add("review-empty");
         return empty;

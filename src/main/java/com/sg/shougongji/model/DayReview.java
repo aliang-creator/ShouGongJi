@@ -22,6 +22,11 @@ public record DayReview(LocalDate date, List<Segment> segments, List<Entry> entr
         public long estimatedSeconds() {
             return segments.stream().filter(segment -> segment.session().estimated()).mapToLong(Segment::seconds).sum();
         }
+
+        public List<String> notes() {
+            return segments.stream().map(segment -> segment.session().note()).filter(note -> !note.isBlank())
+                    .distinct().toList();
+        }
     }
 
     public static DayReview summarize(LocalDate date, long dayStart, long nextDayStart,
@@ -68,8 +73,7 @@ public record DayReview(LocalDate date, List<Segment> segments, List<Entry> entr
             }
             String workItem = workItemLabel.apply(task);
             text.append("\n工作项：").append(workItem.isBlank() ? "待归属" : workItem);
-            entry.segments().stream().map(segment -> segment.session().note()).filter(note -> !note.isBlank())
-                    .distinct().forEach(note -> text.append("\n  · ").append(note.replace("\n", "\n    ")));
+            entry.notes().forEach(note -> text.append("\n  · ").append(note.replace("\n", "\n    ")));
         }
         return text.toString();
     }

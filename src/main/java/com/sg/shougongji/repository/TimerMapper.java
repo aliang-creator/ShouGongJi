@@ -1,5 +1,7 @@
 package com.sg.shougongji.repository;
 
+import com.sg.shougongji.model.ScheduledWork;
+import com.sg.shougongji.model.WorkSchedule;
 import com.sg.shougongji.model.WorkSession;
 import com.sg.shougongji.model.WorkTask;
 import org.apache.ibatis.annotations.Param;
@@ -33,14 +35,29 @@ public interface TimerMapper {
 
     List<WorkSession> findCompletedSessions(@Param("rangeStart") long rangeStart, @Param("rangeEnd") long rangeEnd);
 
+    WorkSchedule findWorkSchedule();
+
+    void saveWorkSchedule(WorkSchedule schedule);
+
+    List<Long> findScheduledSessionIds(@Param("day") String day);
+
+    List<ScheduledWork> findScheduledWork(@Param("day") String day);
+
+    void deleteScheduledSessions(@Param("day") String day);
+
+    void markScheduledSession(@Param("day") String day, @Param("position") long position);
+
+    void unmarkScheduledSession(@Param("sessionId") long sessionId);
+
     String findOverlappingTaskTitle(@Param("sessionIdToIgnore") long sessionIdToIgnore,
-                                    @Param("startedAt") long startedAt, @Param("endedAt") long endedAt);
+                                    @Param("startedAt") long startedAt, @Param("endedAt") long endedAt,
+                                    @Param("includeScheduled") boolean includeScheduled);
 
     void insertActiveSession(@Param("taskId") long taskId, @Param("startedAt") long startedAt);
 
-    int insertManualSession(@Param("taskId") long taskId, @Param("startedAt") long startedAt,
-                            @Param("endedAt") long endedAt, @Param("note") String note,
-                            @Param("estimated") boolean estimated);
+    int insertCompletedSession(@Param("taskId") long taskId, @Param("startedAt") long startedAt,
+                               @Param("endedAt") long endedAt, @Param("note") String note,
+                               @Param("estimated") boolean estimated, @Param("manual") boolean manual);
 
     int updateCompletedSession(@Param("sessionId") long sessionId, @Param("taskId") long taskId,
                                @Param("startedAt") long startedAt, @Param("endedAt") long endedAt,

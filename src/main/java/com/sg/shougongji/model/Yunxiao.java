@@ -76,6 +76,8 @@ public final class Yunxiao {
 
     public record Planning(String start, String end, String assigneeId) {}
 
+    public record WorkItemStatus(Choice current, List<Choice> options) {}
+
     public record Field(String id, String name, String kind, String format, String defaultValue,
                         boolean required, List<Choice> options) {
         public String plannedDate(LocalDate day) {
@@ -90,10 +92,19 @@ public final class Yunxiao {
         }
     }
 
-    public record Effort(String id, String description, String hours, String start, String end) {
+    public record Effort(String id, String description, String hours, String start, String end,
+                         String ownerId, String category) {
+        public LocalDate startDay() {
+            return effortDate(start);
+        }
+
+        public LocalDate endDay() {
+            return effortDate(end);
+        }
+
         public boolean matches(LocalDate day, BigDecimal amount) {
             try {
-                return day.equals(effortDate(start)) && day.equals(effortDate(end))
+                return day.equals(startDay()) && day.equals(endDay())
                         && amount.compareTo(new BigDecimal(hours)) == 0;
             } catch (DateTimeException | NumberFormatException invalid) {
                 return false;
@@ -107,6 +118,10 @@ public final class Yunxiao {
         public ApiException(int status, String message) {
             super(message);
             this.status = status;
+        }
+
+        public int status() {
+            return status;
         }
 
         public boolean rejected() {

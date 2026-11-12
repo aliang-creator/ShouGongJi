@@ -14,6 +14,8 @@ import com.sg.shougongji.model.Yunxiao.PendingWrite;
 import com.sg.shougongji.model.Yunxiao.Planning;
 import com.sg.shougongji.model.Yunxiao.ProtocolException;
 import com.sg.shougongji.model.Yunxiao.WorkItemKind;
+import com.sg.shougongji.model.Yunxiao.WorkItemStatus;
+import com.sg.shougongji.model.YunxiaoWeek;
 import com.sg.shougongji.repository.YunxiaoRepository;
 import com.sg.shougongji.repository.yunxiao.YunxiaoClient;
 
@@ -21,10 +23,17 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.sql.SQLException;
+import java.time.DateTimeException;
+import java.time.DayOfWeek;
 import java.time.LocalDate;
+import java.time.temporal.TemporalAdjusters;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public final class YunxiaoService {
     public static final class UncertainWrite extends IOException {
@@ -68,6 +77,101 @@ public final class YunxiaoService {
         return client.workItemPage(workItemId);
     }
 
+    public YunxiaoWeek weekEffort(LocalDate date) throws SQLException, IOException, InterruptedException {
+        LocalDate monday = date.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY));
+        LocalDate nextMonday = monday.plusWeeks(1);
+        Map<LocalDate, List<YunxiaoWeek.Registration>> byDay = new LinkedHashMap<>();
+        monday.datesUntil(nextMonday).forEach(day -> byDay.put(day, new ArrayList<>()));
+        Map<String, Binding> items = new LinkedHashMap<>();
+        repository.findBindings().values().stream().filter(binding -> binding.scope().equals(scope()))
+                .sorted(Comparator.comparing(Binding::label).thenComparing(Binding::childId))
+                .forEach(binding -> items.putIfAbsent(binding.childId(), binding));
+
+        List<YunxiaoWeek.Registration> multiDay = new ArrayList<>();
+        List<String> unavailable = new ArrayList<>();
+        int unreadable = 0;
+        Choice owner = items.isEmpty() ? null : weekOwner();
+        for (Binding binding : items.values()) {
+            List<Effort> efforts;
+            try {
+                efforts = client.efforts(binding.childId());
+            } catch (ApiException failure) {
+                if (failure.status() != 403 && failure.status() != 404) {
+                    throw failure;
+                }
+                unavailable.add(binding.label() + " · " + failure.getMessage());
+                continue;
+            } catch (ProtocolException malformed) {
+                unavailable.add(binding.label() + " · 工时明细格式无法识别");
+                continue;
+            }
+            Set<String> seen = new HashSet<>();
+            for (Effort effort : efforts) {
+                if (!seen.add(effort.id()) || !effort.ownerId().isBlank() && !effort.ownerId().equals(owner.id())) {
+                    continue;
+                }
+                try {
+                    LocalDate start = effort.startDay();
+                    LocalDate end = effort.endDay();
+                    if (end.isBefore(start)) {
+                        unreadable++;
+                    } else if (start.isBefore(nextMonday) && !end.isBefore(monday)) {
+                        BigDecimal hours = new BigDecimal(effort.hours());
+                        if (effort.ownerId().isBlank() || hours.signum() < 0) {
+                            unreadable++;
+                            continue;
+                        }
+                        var registration = new YunxiaoWeek.Registration(binding.label(), hours, start, end,
+                                effort.category(), effort.description());
+                        if (start.equals(end)) {
+                            byDay.get(start).add(registration);
+                        } else {
+                            multiDay.add(registration);
+                        }
+                    }
+                } catch (DateTimeException | NumberFormatException malformed) {
+                    unreadable++;
+                }
+            }
+        }
+        List<YunxiaoWeek.Day> days = byDay.entrySet().stream()
+                .map(day -> new YunxiaoWeek.Day(day.getKey(), List.copyOf(day.getValue()))).toList();
+        multiDay.sort(Comparator.comparing(YunxiaoWeek.Registration::start));
+        return new YunxiaoWeek(owner == null ? "" : owner.name(), days, List.copyOf(multiDay), items.size(),
+                List.copyOf(unavailable), unreadable);
+    }
+
+    private Choice weekOwner() throws IOException, InterruptedException {
+        try {
+            return client.tokenOwner();
+        } catch (ApiException failure) {
+            if (failure.status() == 403) {
+                throw new IllegalArgumentException("无法识别当前云效账号，请为令牌开通「组织管理 → 用户」只读权限。", failure);
+            }
+            throw failure;
+        }
+    }
+
+    public WorkItemStatus workItemStatus(Binding binding) throws IOException, InterruptedException {
+        checkScope(binding);
+        Choice current = client.currentStatus(binding.childId());
+        List<Choice> options = client.workflowStatuses(binding.childId()).stream()
+                .filter(status -> !status.id().equals(current.id())).toList();
+        return new WorkItemStatus(current, options);
+    }
+
+    public void updateStatus(Binding binding, Choice expected, Choice target) throws IOException, InterruptedException {
+        checkScope(binding);
+        Choice current = client.currentStatus(binding.childId());
+        if (current.id().equals(target.id())) {
+            return;
+        }
+        if (!current.id().equals(expected.id())) {
+            throw new IllegalArgumentException("云效状态已变更，请根据最新状态重新选择。");
+        }
+        client.updateStatus(binding.childId(), target.id());
+    }
+
     public Assignee defaultAssignee() throws SQLException {
         return repository.findAssignee(scope());
     }
@@ -102,6 +206,9 @@ public final class YunxiaoService {
 
     public long timerTask(Choice project, Item item) throws SQLException {
         checkTimerItem(project, item);
+        if (WorkItemKind.REQUIREMENT.matches(item)) {
+            throw new IllegalArgumentException("请在需求下创建子任务并计时。");
+        }
         return repository.taskForExistingItem(new Binding(scope(), item.id(), label(project, null, item.toString())),
                 item.subject().isBlank() ? item.toString() : item.subject());
     }

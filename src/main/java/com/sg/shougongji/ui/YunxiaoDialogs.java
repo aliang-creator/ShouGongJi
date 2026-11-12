@@ -149,6 +149,20 @@ final class YunxiaoDialogs {
         return new WorkDialog(connection, entry, day, null).effortOverlay(binding, onClose, onChanged);
     }
 
+    void editStatus(Window owner, Binding binding) throws SQLException {
+        YunxiaoService connection = connection(owner);
+        if (connection != null) {
+            new StatusDialog(owner, connection, binding).show();
+        }
+    }
+
+    void showWeek(Window owner, LocalDate today) throws SQLException {
+        YunxiaoService connection = connection(owner);
+        if (connection != null) {
+            new YunxiaoWeekDialog(owner, connection, today).show();
+        }
+    }
+
     void create(Window owner, DayReview.Entry entry, LocalDate day, Consumer<Binding> onBound) throws SQLException {
         showBindingDialog(owner, entry, day, true, onBound);
     }
@@ -185,6 +199,87 @@ final class YunxiaoDialogs {
             connection = settings.currentConnection();
         }
         return connection;
+    }
+
+    private static final class StatusDialog {
+        private final YunxiaoService connection;
+        private final Binding binding;
+        private final Dialog<ButtonType> dialog;
+        private final SimpleBooleanProperty busy = new SimpleBooleanProperty();
+        private final Label currentLabel = label("—", "section-title", "wrap");
+        private final ComboBox<Choice> target = new ComboBox<>();
+        private final Label feedback = label("", "muted", "wrap");
+        private Choice current;
+        private boolean saving;
+
+        StatusDialog(Window owner, YunxiaoService connection, Binding binding) {
+            this.connection = connection;
+            this.binding = binding;
+            Button reload = button("刷新", "subtle");
+            reload.setAccessibleText("刷新云效状态");
+            reload.disableProperty().bind(busy);
+            reload.setOnAction(event -> load(""));
+            HBox currentRow = new HBox(8, currentLabel, spacer(), reload);
+            currentRow.setAlignment(Pos.CENTER_LEFT);
+            target.setPromptText("选择目标状态");
+            target.disableProperty().bind(busy.or(Bindings.isEmpty(target.getItems())));
+            feedback.managedProperty().bind(feedback.textProperty().isNotEmpty());
+            VBox fields = new VBox(10, label(binding.label(), "section-title", "wrap"),
+                    field("当前状态", currentRow), field("目标状态", target), feedback);
+            dialog = form(owner, "云效状态", fields, "保存状态");
+            Node save = dialog.getDialogPane().lookupButton(dialog.getDialogPane().getButtonTypes().getFirst());
+            save.disableProperty().bind(busy.or(target.valueProperty().isNull()));
+            save.addEventFilter(ActionEvent.ACTION, event -> {
+                event.consume();
+                save();
+            });
+            dialog.setOnCloseRequest(event -> {
+                if (saving) {
+                    event.consume();
+                }
+            });
+        }
+
+        void show() {
+            dialog.show();
+            load("");
+        }
+
+        private void load(String message) {
+            busy.set(true);
+            target.setValue(null);
+            target.getItems().clear();
+            feedback.setText(message + "正在读取云效状态…");
+            background(() -> connection.workItemStatus(binding), result -> {
+                current = result.current();
+                currentLabel.setText(current.name());
+                target.getItems().setAll(result.options());
+                feedback.setText(result.options().isEmpty() ? message + "此工作流没有其他状态。" : message);
+                busy.set(false);
+            }, error -> {
+                currentLabel.setText("—");
+                feedback.setText(message + "读取云效状态失败。" + errorText(error));
+                busy.set(false);
+            });
+        }
+
+        private void save() {
+            Choice expected = current;
+            Choice selected = target.getValue();
+            busy.set(true);
+            saving = true;
+            feedback.setText("正在保存云效状态…");
+            background(() -> {
+                connection.updateStatus(binding, expected, selected);
+                return null;
+            }, result -> {
+                saving = false;
+                load("状态修改已提交。");
+            }, error -> {
+                saving = false;
+                load(errorText(error));
+            });
+        }
     }
 
     private final class AssigneeSettings {
@@ -479,7 +574,8 @@ final class YunxiaoDialogs {
             private final ListView<Item> items = new ListView<>();
             private final Button more = button("加载更多", "secondary");
             private final Button direct = button("直接计时", "primary");
-            private final Button create = button("在此工作项下计时…", "secondary");
+            private final Button create = button("创建子任务并计时…", "primary");
+            private final SimpleBooleanProperty childTypesAvailable = new SimpleBooleanProperty();
             private final String initialTitle;
             private final Assignee defaultAssignee;
             private VBox pane;
@@ -514,9 +610,16 @@ final class YunxiaoDialogs {
                 items.getSelectionModel().selectedItemProperty().addListener(
                         (observable, old, item) -> select(item));
                 direct.disableProperty().bind(items.getSelectionModel().selectedItemProperty().isNull());
+                direct.visibleProperty().bind(requirements.selectedProperty().not());
+                direct.managedProperty().bind(direct.visibleProperty());
                 direct.setOnAction(event -> startSelected());
+                create.disableProperty().bind(childTypesAvailable.not());
+                create.visibleProperty().bind(requirements.selectedProperty().or(childTypesAvailable));
                 create.managedProperty().bind(create.visibleProperty());
-                create.setVisible(false);
+                requirements.selectedProperty().addListener((observable, old, selected) -> {
+                    create.getStyleClass().remove(selected ? "secondary" : "primary");
+                    create.getStyleClass().add(selected ? "primary" : "secondary");
+                });
                 more.managedProperty().bind(more.visibleProperty());
                 more.setVisible(false);
                 VBox searchFields = new VBox(5, filters, new HBox(8, query, search));
@@ -576,7 +679,7 @@ final class YunxiaoDialogs {
                 if (typesRequest != null) {
                     typesRequest.cancel();
                 }
-                create.setVisible(false);
+                childTypesAvailable.set(false);
                 if (searchRequest == null) {
                     status.setText("");
                 }
@@ -586,7 +689,10 @@ final class YunxiaoDialogs {
                 Choice project = projects.combo.getValue();
                 typesRequest = background(() -> connection.taskTypes(project.id(), item.typeId()), types -> {
                     if (isSelected(project, item)) {
-                        create.setVisible(!types.isEmpty());
+                        childTypesAvailable.set(!types.isEmpty());
+                        if (types.isEmpty() && WorkItemKind.REQUIREMENT.matches(item) && searchRequest == null) {
+                            status.setText("这个需求没有可用的子任务类型。");
+                        }
                         create.setOnAction(event -> {
                             cancelReads();
                             new CreationForm(defaultAssignee, new ParentSelection(project, item, types),

@@ -50,6 +50,7 @@ public final class YunxiaoClient {
         HttpResponse<String> send(HttpRequest request) throws IOException, InterruptedException;
     }
 
+    private final String endpoint;
     private final String scope;
     private final String token;
     private final Transport transport;
@@ -85,13 +86,18 @@ public final class YunxiaoClient {
         }
         String host = address.getHost().toLowerCase(Locale.ROOT);
         int port = address.getPort();
-        scope = "https://" + host + (port == -1 || port == 443 ? "" : ":" + port)
-                + "/oapi/v1/projex" + (central ? "/organizations/" + id(org) : "");
+        this.endpoint = "https://" + host + (port == -1 || port == 443 ? "" : ":" + port);
+        scope = this.endpoint + "/oapi/v1/projex" + (central ? "/organizations/" + id(org) : "");
         this.transport = transport;
     }
 
     public String scope() {
         return scope;
+    }
+
+    public Choice tokenOwner() throws IOException, InterruptedException {
+        JsonObject user = object(parse(requestAt("GET", endpoint + "/oapi/v1/platform/user", null).body()));
+        return new Choice(requiredId(user, "id"), string(user, "name"));
     }
 
     public String workItemPage(String workItemId) {
@@ -195,6 +201,28 @@ public final class YunxiaoClient {
         return object(parse(request("GET", "/workitems/" + id(workItemId), null).body()));
     }
 
+    public Choice currentStatus(String workItemId) throws IOException, InterruptedException {
+        return statusChoice(object(workItemDetails(workItemId).get("status")));
+    }
+
+    public List<Choice> workflowStatuses(String workItemId) throws IOException, InterruptedException {
+        JsonObject workflow = object(parse(request("GET", "/workitems/" + id(workItemId) + "/workflow", null).body()));
+        return objects(workflow.get("statuses")).stream().map(YunxiaoClient::statusChoice).toList();
+    }
+
+    public void updateStatus(String workItemId, String statusId) throws IOException, InterruptedException {
+        request("PUT", "/workitems/" + id(workItemId), Map.of("status", id(statusId)));
+    }
+
+    private static Choice statusChoice(JsonObject status) {
+        String statusId = requiredId(status, "id");
+        String name = string(status, "displayName");
+        if (name.isBlank()) {
+            name = string(status, "name");
+        }
+        return new Choice(statusId, name.isBlank() ? statusId : name);
+    }
+
     public List<Choice> taskTypes(String projectId, String parentType) throws IOException, InterruptedException {
         List<JsonObject> relations = objects(request("GET", "/workitemTypes/" + id(parentType)
                 + "/relationWorkitemTypes?relationType=SUB", null).body());
@@ -253,7 +281,8 @@ public final class YunxiaoClient {
     private List<Effort> effortList(String path) throws IOException, InterruptedException {
         return objects(request("GET", path, null).body()).stream()
                 .map(record -> new Effort(requiredId(record, "id"), string(record, "description"),
-                        string(record, "actualTime"), string(record, "gmtStart"), string(record, "gmtEnd"))).toList();
+                        string(record, "actualTime"), string(record, "gmtStart"), string(record, "gmtEnd"),
+                        nestedId(record, "owner"), string(record, "workType"))).toList();
     }
 
     public Planning planning(String workItemId) throws IOException, InterruptedException {
@@ -329,7 +358,12 @@ public final class YunxiaoClient {
 
     private HttpResponse<String> request(String method, String path, Object body)
             throws IOException, InterruptedException {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(scope + path)).timeout(Duration.ofSeconds(18))
+        return requestAt(method, scope + path, body);
+    }
+
+    private HttpResponse<String> requestAt(String method, String url, Object body)
+            throws IOException, InterruptedException {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(18))
                 .header("x-yunxiao-token", token).header("Accept", "application/json");
         HttpRequest.BodyPublisher payload = HttpRequest.BodyPublishers.noBody();
         if (body != null) {

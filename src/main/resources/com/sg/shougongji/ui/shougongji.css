@@ -478,6 +478,62 @@
 .dialog-pane:header .header-panel .label { -fx-font-size: 18px; -fx-font-weight: bold; }
 .dialog-pane > .content, .dialog-pane > .content.label { -fx-padding: 16 22; }
 .dialog-pane > .button-bar > .container { -fx-padding: 0 22 17; }
+.yunxiao-week .week-overview {
+    -fx-padding: 11 15;
+    -fx-background-color: linear-gradient(to right, #e8f1ff, #fbfcff);
+    -fx-background-radius: 12;
+    -fx-border-color: #d9e4f3;
+    -fx-border-radius: 12;
+}
+.yunxiao-week .week-total {
+    -fx-font-size: 30px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #213b60;
+}
+.yunxiao-week .week-day {
+    -fx-min-height: 92;
+    -fx-padding: 8 4;
+    -fx-alignment: center;
+    -fx-graphic-text-gap: 0;
+    -fx-background-color: #fbfcff;
+    -fx-background-radius: 10;
+    -fx-border-color: #dce4ef;
+    -fx-border-radius: 10;
+    -fx-cursor: hand;
+}
+.yunxiao-week .week-day > .radio, .yunxiao-week .week-day > .radio > .dot {
+    -fx-padding: 0;
+    -fx-background-color: transparent;
+}
+.yunxiao-week .week-day:hover { -fx-background-color: #edf4fe; }
+.yunxiao-week .week-day:selected {
+    -fx-background-color: #e2eeff;
+    -fx-border-color: #7a9dcc;
+}
+.yunxiao-week .week-day:focused { -fx-border-color: -sg-focus; }
+.yunxiao-week .week-day-name { -fx-font-weight: bold; }
+.yunxiao-week .week-day-today .week-day-name { -fx-text-fill: -sg-blue-dark; }
+.yunxiao-week .week-day-hours {
+    -fx-font-size: 20px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #254b7f;
+}
+.yunxiao-week .week-day-empty .week-day-hours { -fx-text-fill: #637086; }
+.yunxiao-week .week-day-unit { -fx-font-size: 11px; -fx-text-fill: -sg-muted; }
+.yunxiao-week .week-details {
+    -fx-padding: 10 14 3;
+    -fx-background-color: #ffffffbf;
+    -fx-background-radius: 12;
+    -fx-border-color: #dce4ef;
+    -fx-border-radius: 12;
+}
+.yunxiao-week .week-registration {
+    -fx-padding: 9 0;
+    -fx-border-color: -sg-line;
+    -fx-border-width: 1 0 0;
+}
+.yunxiao-week .week-details .week-registration { -fx-border-insets: 5 0 0; -fx-padding: 12 0 9; }
+.yunxiao-week .week-empty { -fx-padding: 10 0 11; }
 .effort-overlay { -fx-background-color: #18243a29; }
 .effort-card {
     -fx-background-color: #f7f8fc;

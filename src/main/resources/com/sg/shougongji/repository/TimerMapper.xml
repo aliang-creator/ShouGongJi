@@ -96,6 +96,41 @@
         ORDER BY s.started_at, s.id
     </select>
 
+    <select id="findWorkSchedule" resultType="com.sg.shougongji.model.WorkSchedule">
+        SELECT morning_start, morning_end, afternoon_start, afternoon_end FROM work_schedule WHERE id = 1
+    </select>
+
+    <insert id="saveWorkSchedule">
+        INSERT INTO work_schedule (id, morning_start, morning_end, afternoon_start, afternoon_end)
+        VALUES (1, #{morningStart}, #{morningEnd}, #{afternoonStart}, #{afternoonEnd})
+        ON CONFLICT (id) DO UPDATE SET morning_start = excluded.morning_start, morning_end = excluded.morning_end,
+            afternoon_start = excluded.afternoon_start, afternoon_end = excluded.afternoon_end
+    </insert>
+
+    <select id="findScheduledSessionIds" resultType="long">
+        SELECT session_id FROM scheduled_session WHERE day = #{day}
+    </select>
+
+    <select id="findScheduledWork" resultType="com.sg.shougongji.model.ScheduledWork">
+        SELECT placement.position, s.task_id, SUM(s.ended_at - s.started_at), s.note, s.estimated
+        FROM scheduled_session placement JOIN work_session s ON s.id = placement.session_id
+        WHERE placement.day = #{day}
+        GROUP BY placement.position, s.task_id, s.note, s.estimated
+        ORDER BY placement.position
+    </select>
+
+    <delete id="deleteScheduledSessions">
+        DELETE FROM work_session WHERE id IN (SELECT session_id FROM scheduled_session WHERE day = #{day})
+    </delete>
+
+    <insert id="markScheduledSession">
+        INSERT INTO scheduled_session (session_id, day, position) VALUES (last_insert_rowid(), #{day}, #{position})
+    </insert>
+
+    <delete id="unmarkScheduledSession">
+        DELETE FROM scheduled_session WHERE session_id = #{sessionId}
+    </delete>
+
     <select id="findOverlappingTaskTitle" resultType="string">
         SELECT COALESCE(c.display_title, t.title)
         FROM work_session s JOIN task t ON t.id = s.task_id
@@ -103,6 +138,9 @@
         WHERE s.id &lt;&gt; #{sessionIdToIgnore}
           AND s.started_at &lt; #{endedAt}
           AND (s.ended_at IS NULL OR s.ended_at &gt; #{startedAt})
+        <if test="!includeScheduled">
+          AND NOT EXISTS (SELECT 1 FROM scheduled_session placement WHERE placement.session_id = s.id)
+        </if>
         ORDER BY s.started_at
         LIMIT 1
     </select>
@@ -111,9 +149,9 @@
         INSERT INTO work_session (task_id, started_at) VALUES (#{taskId}, #{startedAt})
     </insert>
 
-    <insert id="insertManualSession">
+    <insert id="insertCompletedSession">
         INSERT INTO work_session (task_id, started_at, ended_at, note, estimated, manual)
-        VALUES (#{taskId}, #{startedAt}, #{endedAt}, #{note}, #{estimated}, 1)
+        VALUES (#{taskId}, #{startedAt}, #{endedAt}, #{note}, #{estimated}, #{manual})
     </insert>
 
     <update id="updateCompletedSession">

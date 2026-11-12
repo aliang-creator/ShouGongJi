@@ -14,6 +14,8 @@ import com.sg.shougongji.model.Yunxiao.Item;
 import com.sg.shougongji.model.Yunxiao.Page;
 import com.sg.shougongji.model.Yunxiao.PendingWrite;
 import com.sg.shougongji.model.Yunxiao.WorkItemKind;
+import com.sg.shougongji.model.Yunxiao.WorkItemStatus;
+import com.sg.shougongji.model.YunxiaoWeek;
 import com.sg.shougongji.repository.WorkLogDatabase;
 import com.sg.shougongji.repository.YunxiaoRepository;
 import com.sg.shougongji.service.TimerService;
@@ -49,6 +51,132 @@ import static org.junit.jupiter.api.Assertions.*;
 class YunxiaoServiceTest {
     @TempDir
     Path directory;
+
+    @Test
+    void weeklyEffortReadsOnlyThisAccountsLinkedRecordsAndKeepsMultiDayRegistrationsSeparate() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoRepository repository = open();
+        YunxiaoService sync = new YunxiaoService(repository, cloud.central());
+        TimerService timer = servicesAt(Instant.parse("2026-11-12T03:00:00Z")).timer();
+        List<Binding> bindings = List.of(new Binding(sync.scope(), "item-a", "项目 / A"),
+                new Binding(sync.scope(), "item-a", "项目 / A"), new Binding(sync.scope(), "item-b", "项目 / B"),
+                new Binding("another-organization", "other", "其他组织"));
+        for (int index = 0; index < bindings.size(); index++) {
+            timer.start("本地事项 " + index);
+            repository.bind(timer.active().task().id(), bindings.get(index));
+        }
+        cloud.answerAt("GET", YunxiaoClient.CENTRAL_ENDPOINT + "/oapi/v1/platform/user",
+                request -> response(request, 200, "{\"id\":\"my-account\",\"name\":\"本人\"}"));
+        long thursday = LocalDate.of(2026, 11, 12).atStartOfDay(ZoneOffset.ofHours(8)).toInstant().toEpochMilli();
+        cloud.answer("GET", "/workitems/item-a/effortRecords", """
+                [{"id":"mine","owner":{"id":"my-account"},"actualTime":1.5,
+                  "gmtStart":%d,"gmtEnd":%d,"workType":"开发","description":"联调"},
+                 {"id":"mine","owner":{"id":"my-account"},"actualTime":1.5,"gmtStart":%d,"gmtEnd":%d},
+                 {"id":"sunday","owner":{"id":"my-account"},"actualTime":0.25,
+                  "gmtStart":"2026-11-15","gmtEnd":"2026-11-15"},
+                 {"id":"theirs","owner":{"id":"colleague"},"creator":{"id":"my-account"},"actualTime":8,
+                  "gmtStart":"2026-11-12","gmtEnd":"2026-11-12"},
+                 {"id":"range","owner":{"id":"my-account"},"actualTime":9,
+                  "gmtStart":"2026-11-08","gmtEnd":"2026-11-09"},
+                 {"id":"next-week","owner":{"id":"my-account"},"actualTime":4,
+                  "gmtStart":"2026-11-16","gmtEnd":"2026-11-16"},
+                 {"id":"no-owner","actualTime":7,"gmtStart":"2026-11-12","gmtEnd":"2026-11-12"}]
+                """.formatted(thursday, thursday, thursday, thursday));
+        cloud.answer("GET", "/workitems/item-b/effortRecords", request -> response(request, 403, "{}"));
+
+        YunxiaoWeek week = sync.weekEffort(LocalDate.of(2026, 11, 12));
+        assertEquals("本人", week.accountName());
+        assertEquals(2, week.workItemCount());
+        assertEquals(1, week.unavailableItems().size());
+        assertTrue(week.unavailableItems().getFirst().startsWith("项目 / B"));
+        assertEquals(1, week.unreadableRecords());
+        assertEquals(7, week.days().size());
+        assertEquals(LocalDate.of(2026, 11, 9), week.days().getFirst().date());
+        assertEquals(BigDecimal.ZERO, week.days().getFirst().hours());
+        assertEquals(new BigDecimal("1.5"), week.days().get(3).hours());
+        assertEquals("联调", week.days().get(3).records().getFirst().description());
+        assertEquals(new BigDecimal("0.25"), week.days().getLast().hours());
+        assertEquals(new BigDecimal("1.75"), week.dailyHours());
+        assertEquals(1, week.multiDay().size());
+        assertEquals(new BigDecimal("9"), week.multiDay().getFirst().hours());
+        cloud.assertDone();
+    }
+
+    @Test
+    void weeklyEffortReportsWhenTheTokenCannotReadItsAccount() throws Exception {
+        Cloud cloud = new Cloud("https://projex.example.test/oapi/v1/projex");
+        YunxiaoClient client = new YunxiaoClient("https://projex.example.test", "", "test-token", cloud::send);
+        YunxiaoService sync = new YunxiaoService(open(), client);
+        LocalDate day = LocalDate.of(2026, 11, 12);
+        assertEquals(0, sync.weekEffort(day).workItemCount());
+        bind(sync, task());
+        cloud.answerAt("GET", "https://projex.example.test/oapi/v1/platform/user",
+                request -> response(request, 403, "{}"));
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () -> sync.weekEffort(day));
+        assertTrue(error.getMessage().contains("组织管理 → 用户"));
+        cloud.assertDone();
+    }
+
+    @Test
+    void readsCustomWorkflowStatesAndUpdatesTheLinkedItemByStatusId() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoService sync = new YunxiaoService(open(), cloud.central());
+        Binding binding = bind(sync, task());
+        String todo = """
+                {"status":{"id":"todo","displayName":"待处理","name":"待办"}}
+                """;
+        String workflow = """
+                {"statuses":[{"id":"todo","name":"待办"},
+                             {"id":"doing-27","displayName":"处理中","name":"进行中"},
+                             {"id":"review-86","name":"待审核"}]}
+                """;
+        Choice doing = new Choice("doing-27", "处理中");
+        cloud.answer("GET", "/workitems/child-1", todo);
+        cloud.answer("GET", "/workitems/child-1/workflow", workflow);
+        WorkItemStatus status = sync.workItemStatus(binding);
+        assertEquals(new Choice("todo", "待处理"), status.current());
+        assertEquals(List.of(doing, new Choice("review-86", "待审核")), status.options());
+
+        cloud.answer("GET", "/workitems/child-1", todo);
+        cloud.answer("PUT", "/workitems/child-1", request -> {
+            assertEquals(JsonParser.parseString("{\"status\":\"doing-27\"}"), body(request));
+            return response(request, 204, "");
+        });
+        sync.updateStatus(binding, status.current(), doing);
+
+        cloud.answer("GET", "/workitems/child-1", "{\"status\":{\"id\":\"doing-27\",\"displayName\":\"处理中\"}}");
+        cloud.answer("GET", "/workitems/child-1/workflow", workflow);
+        WorkItemStatus reloaded = sync.workItemStatus(binding);
+        assertEquals(doing, reloaded.current());
+        assertFalse(reloaded.options().contains(doing));
+        cloud.assertDone();
+    }
+
+    @Test
+    void checksTheCurrentStatusBeforeWritingAndSurfacesWorkflowRejections() throws Exception {
+        Cloud cloud = new Cloud("https://projex.example.test/oapi/v1/projex");
+        YunxiaoClient client = new YunxiaoClient("https://projex.example.test", "", "test-token", cloud::send);
+        YunxiaoService sync = new YunxiaoService(open(), client);
+        Binding binding = bind(sync, task());
+        Choice todo = new Choice("todo", "待处理");
+        Choice done = new Choice("done", "已完成");
+        Binding anotherOrg = new Binding(new Cloud().central().scope(), binding.childId(), binding.label());
+        assertThrows(IllegalArgumentException.class, () -> sync.workItemStatus(anotherOrg));
+        assertThrows(IllegalArgumentException.class, () -> sync.updateStatus(anotherOrg, todo, done));
+
+        cloud.answer("GET", "/workitems/child-1", "{\"status\":{\"id\":\"doing\",\"name\":\"处理中\"}}");
+        assertThrows(IllegalArgumentException.class, () -> sync.updateStatus(binding, todo, done));
+        cloud.answer("GET", "/workitems/child-1", "{\"status\":{\"id\":\"done\",\"name\":\"已完成\"}}");
+        sync.updateStatus(binding, todo, done);
+        cloud.assertDone();
+
+        cloud.answer("GET", "/workitems/child-1", "{\"status\":{\"id\":\"todo\",\"name\":\"待处理\"}}");
+        cloud.answer("PUT", "/workitems/child-1", request ->
+                response(request, 403, "{\"message\":\"该流转需要填写审核人\"}"));
+        ApiException rejection = assertThrows(ApiException.class, () -> sync.updateStatus(binding, todo, done));
+        assertTrue(rejection.getMessage().contains("该流转需要填写审核人"));
+        cloud.assertDone();
+    }
 
     @Test
     void searchesSubtasksByTitleOrNumberWithinTheProject() throws Exception {
@@ -126,6 +254,23 @@ class YunxiaoServiceTest {
         });
         assertEquals(new Page<Item>(List.of(), 0),
                 sync.timerItems("project-1", WorkItemKind.INDEPENDENT_TASK, "", independent.next()));
+        cloud.assertDone();
+    }
+
+    @Test
+    void requiresAChildForRequirementsAndAllowsDirectTimingForExistingTasks() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoRepository repository = open();
+        YunxiaoService sync = new YunxiaoService(repository, cloud.central());
+        Choice project = new Choice("project-1", "项目");
+        Item requirement = new Item("req-1", "PRJ-1", "需求", "req-type", project.id(), "Req", "", "");
+        Item independent = new Item("task-1", "PRJ-2", "独立任务", "task-type", project.id(), "Task", "", "");
+        Item subtask = new Item("child-1", "PRJ-3", "已有子任务", "task-type", project.id(), "Task", requirement.id(), "");
+
+        assertThrows(IllegalArgumentException.class, () -> sync.timerTask(project, requirement));
+        assertTrue(repository.findBindings().isEmpty());
+        assertEquals(independent.id(), repository.findBinding(sync.timerTask(project, independent)).childId());
+        assertEquals(subtask.id(), repository.findBinding(sync.timerTask(project, subtask)).childId());
         cloud.assertDone();
     }
 
@@ -697,9 +842,13 @@ class YunxiaoServiceTest {
         }
 
         void answer(String method, String path, Function<HttpRequest, Response> response) {
+            answerAt(method, base + path, response);
+        }
+
+        void answerAt(String method, String url, Function<HttpRequest, Response> response) {
             calls.add(request -> {
                 assertEquals(method, request.method());
-                assertEquals(base + path, request.uri().toString());
+                assertEquals(url, request.uri().toString());
                 assertEquals("test-token", request.headers().firstValue("x-yunxiao-token").orElseThrow());
                 return response.apply(request);
             });

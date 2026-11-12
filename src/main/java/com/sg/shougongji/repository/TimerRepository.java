@@ -1,5 +1,6 @@
 package com.sg.shougongji.repository;
 
+import com.sg.shougongji.model.WorkSchedule;
 import com.sg.shougongji.model.WorkSession;
 import com.sg.shougongji.model.WorkTask;
 
@@ -23,6 +24,10 @@ public final class TimerRepository {
 
     public List<WorkSession> findCompletedSessions(long rangeStart, long rangeEnd) throws SQLException {
         return database.read(TimerMapper.class, mapper -> mapper.findCompletedSessions(rangeStart, rangeEnd));
+    }
+
+    public WorkSchedule findWorkSchedule() throws SQLException {
+        return database.read(TimerMapper.class, TimerMapper::findWorkSchedule);
     }
 
     /** 通过同一会话执行整次计时变更，回调结束后提交或回滚。 */

@@ -19,6 +19,22 @@ ON work_session ((1)) WHERE ended_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS session_time ON work_session (started_at);
 
+CREATE TABLE IF NOT EXISTS work_schedule (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    morning_start INTEGER NOT NULL,
+    morning_end INTEGER NOT NULL,
+    afternoon_start INTEGER NOT NULL,
+    afternoon_end INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scheduled_session (
+    session_id INTEGER PRIMARY KEY REFERENCES work_session(id) ON DELETE CASCADE,
+    day TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS scheduled_session_day ON scheduled_session (day, position);
+
 CREATE TABLE IF NOT EXISTS hidden_recent_task (
     task_id INTEGER PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE
 );

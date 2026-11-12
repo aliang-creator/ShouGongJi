@@ -2,6 +2,7 @@ package com.sg.shougongji.service;
 
 import com.sg.shougongji.AppServices;
 import com.sg.shougongji.model.DayReview;
+import com.sg.shougongji.model.WorkSchedule;
 import com.sg.shougongji.model.WorkSession;
 import com.sg.shougongji.model.WorkTask;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,6 +14,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -77,6 +79,98 @@ class TimerServiceTest {
         assertTrue(review.clipboardText().contains("PROJ-123"));
         assertTrue(review.clipboardText().contains("确认上线范围"));
         assertEquals("当前事项", services.timer().active().task().title());
+    }
+
+    @Test
+    void schedulesBySaveOrderSkipsLunchAndReflowsLaterWorkWhenHoursChange() throws Exception {
+        at("20:00");
+        WorkSchedule custom = new WorkSchedule(560, 740, 830, 1150);
+        services.timer().saveWorkSchedule(custom);
+        services = reopen();
+        assertEquals(custom, services.timer().workSchedule());
+
+        services.timer().addWorkHours(DAY, null, "事项甲", 3 * 3600, "甲备注", false);
+        services.timer().addWorkHours(DAY, null, "事项乙", 150 * 60, "乙备注", true);
+        services.timer().addWorkHours(DAY, null, "事项丙", 90 * 60, "", false);
+        DayReview first = services.review().loadDay(DAY);
+        assertEquals(List.of("09:20–12:20", "13:50–16:20", "16:20–17:50"), ranges(first));
+
+        services = reopen();
+        services.timer().editWorkHours(DAY, first.entries().getFirst(), 2 * 3600, "甲备注", false);
+        DayReview edited = services.review().loadDay(DAY);
+        assertEquals(List.of("09:20–11:20", "11:20–12:20", "13:50–15:20", "15:20–16:50"), ranges(edited));
+        assertEquals(List.of("事项甲", "事项乙", "事项丙"),
+                edited.entries().stream().map(entry -> entry.task().title()).toList());
+        assertEquals(150 * 60, edited.entries().get(1).estimatedSeconds());
+        assertEquals(List.of("乙备注"), edited.entries().get(1).notes());
+    }
+
+    @Test
+    void canEditToEightHoursBeforeTheConfiguredWorkdayEnds() throws Exception {
+        at("14:00");
+        services.timer().start("欧洲DW改造");
+        at("14:42");
+        pause();
+        at("15:27");
+        DayReview.Entry entry = services.review().loadDay(DAY).entries().getFirst();
+
+        services.timer().editWorkHours(DAY, entry, 8 * 3600, "", false);
+        DayReview filled = services.review().loadDay(DAY);
+        assertEquals(8 * 3600, filled.seconds());
+        assertEquals(List.of("09:20–12:20", "13:50–18:50"), ranges(filled));
+        assertThrows(IllegalArgumentException.class,
+                () -> services.timer().addWorkHours(DAY, null, "超出时段", 60, "", false));
+        assertEquals(filled, services.review().loadDay(DAY));
+
+        at("15:30");
+        services.timer().start("实时计时");
+        at("15:35");
+        pause();
+        DayReview withLiveRecord = services.review().loadDay(DAY);
+        assertEquals(List.of("09:20–12:20", "13:50–18:50", "15:30–15:35"), ranges(withLiveRecord));
+        assertFalse(withLiveRecord.segments().getLast().session().manual());
+    }
+
+    @Test
+    void leavesRecordedAndActiveTimeInPlaceAndRollsBackWhenWorkDoesNotFit() throws Exception {
+        at("10:00");
+        services.timer().start("已有计时");
+        at("10:30");
+        pause();
+        at("14:00");
+        services.timer().start("正在计时");
+        WorkSession active = services.timer().active();
+        at("15:00");
+        services.timer().addWorkHours(DAY, null, "补录", 2 * 3600, "", false);
+        DayReview before = services.review().loadDay(DAY);
+        assertEquals(List.of("09:20–10:00", "10:00–10:30", "10:30–11:50"), ranges(before));
+
+        IllegalArgumentException overflow = assertThrows(IllegalArgumentException.class,
+                () -> services.timer().addWorkHours(DAY, null, "放不下的事项", 271 * 60, "", false));
+        assertTrue(overflow.getMessage().contains("4 小时 30 分钟"));
+        assertEquals(before, services.review().loadDay(DAY));
+        assertEquals(active, services.timer().active());
+        assertEquals(3, services.timer().tasks().size());
+        services.timer().addWorkHours(DAY, null, "正好填满", 270 * 60, "", false);
+        assertEquals(List.of("09:20–10:00", "10:00–10:30", "10:30–11:50", "11:50–12:20", "13:50–14:00", "15:00–18:50"),
+                ranges(services.review().loadDay(DAY)));
+    }
+
+    @Test
+    void editsOnlyTheSelectedDaysPartOfAnOlderCrossMidnightRecord() throws Exception {
+        at("23:40");
+        services.timer().start("值班");
+        LocalDate tomorrow = DAY.plusDays(1);
+        clock.time = tomorrow.atTime(0, 20).atZone(ZONE).toInstant();
+        pause();
+        DayReview before = services.review().loadDay(DAY);
+        services.timer().editWorkHours(DAY, before.entries().getFirst(), 3 * 3600, "补齐", false);
+        DayReview edited = services.review().loadDay(DAY);
+        assertEquals(List.of("09:20–12:20"), ranges(edited));
+        WorkSession nextDay = services.review().loadDay(tomorrow).segments().getFirst().session();
+        assertEquals(tomorrow.atStartOfDay(ZONE).toEpochSecond(), nextDay.start());
+        assertEquals(1200, nextDay.end() - nextDay.start());
+        assertFalse(nextDay.manual());
     }
 
     @Test
@@ -178,6 +272,11 @@ class TimerServiceTest {
 
     private AppServices reopen() throws Exception {
         return AppServices.open(directory.resolve("worklog.sqlite"), clock);
+    }
+
+    private static List<String> ranges(DayReview review) {
+        return review.segments().stream().map(segment -> Instant.ofEpochSecond(segment.start()).atZone(ZONE).toLocalTime()
+                + "–" + Instant.ofEpochSecond(segment.end()).atZone(ZONE).toLocalTime()).toList();
     }
 
     private void pause() throws Exception {
