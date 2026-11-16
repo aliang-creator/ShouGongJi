@@ -50,6 +50,7 @@ public final class Yunxiao {
 
     public enum WorkItemKind {
         REQUIREMENT("Req"),
+        TASK("Task"),
         INDEPENDENT_TASK("Task"),
         SUBTASK("Task");
 
@@ -65,7 +66,7 @@ public final class Yunxiao {
 
         public boolean matches(Item item) {
             return category.equals(item.category()) && switch (this) {
-                case REQUIREMENT -> true;
+                case REQUIREMENT, TASK -> true;
                 case INDEPENDENT_TASK -> item.parentId().isBlank();
                 case SUBTASK -> !item.parentId().isBlank();
             };

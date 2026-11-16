@@ -30,6 +30,8 @@ interface YunxiaoMapper {
 
     Long findTaskForItem(@Param("binding") Binding binding);
 
+    Long findTaskForEffort(@Param("binding") Binding binding, @Param("operation") String operation);
+
     Long findChildTimerTask(@Param("scope") String scope, @Param("parentId") String parentId,
                             @Param("title") String title);
 

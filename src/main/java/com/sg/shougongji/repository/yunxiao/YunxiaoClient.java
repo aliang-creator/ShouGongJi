@@ -236,7 +236,16 @@ public final class YunxiaoClient {
     }
 
     public List<Choice> taskTypes(String projectId) throws IOException, InterruptedException {
-        return objects(request("GET", "/projects/" + id(projectId) + "/workitemTypes?category=Task", null).body())
+        return workItemTypes(projectId, WorkItemKind.INDEPENDENT_TASK);
+    }
+
+    public List<Choice> requirementTypes(String projectId) throws IOException, InterruptedException {
+        return workItemTypes(projectId, WorkItemKind.REQUIREMENT);
+    }
+
+    private List<Choice> workItemTypes(String projectId, WorkItemKind kind) throws IOException, InterruptedException {
+        String path = "/projects/" + id(projectId) + "/workitemTypes?category=" + kind.category();
+        return objects(request("GET", path, null).body())
                 .stream().filter(type -> bool(type, "enable", true))
                 .sorted(Comparator.comparing(type -> !bool(type, "defaultType", false)))
                 .map(type -> new Choice(requiredId(type, "id"), string(type, "name"))).toList();
@@ -257,8 +266,8 @@ public final class YunxiaoClient {
                         fieldOptions(field))).toList();
     }
 
-    public String createTask(String projectId, String parentId, String typeId, String subject,
-                             String assignee, String description, Map<String, String> custom)
+    public String createWorkItem(String projectId, String parentId, String typeId, String subject,
+                                 String assignee, String description, Map<String, String> custom)
             throws IOException, InterruptedException {
         Map<String, Object> body = new LinkedHashMap<>(Map.of("spaceId", id(projectId),
                 "workitemTypeId", id(typeId), "subject", subject, "assignedTo", id(assignee),

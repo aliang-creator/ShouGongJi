@@ -63,6 +63,10 @@ public final class YunxiaoRepository {
         return database.read(YunxiaoMapper.class, mapper -> mapper.findBinding(taskId));
     }
 
+    public Long findTaskForEffort(Binding binding, String operation) throws SQLException {
+        return database.read(YunxiaoMapper.class, mapper -> mapper.findTaskForEffort(binding, operation));
+    }
+
     public void bind(long taskId, Binding binding) throws SQLException {
         database.write(YunxiaoMapper.class, mapper -> {
             if (mapper.saveBinding(taskId, binding) != 1) {

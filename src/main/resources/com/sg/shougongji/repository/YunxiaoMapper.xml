@@ -93,6 +93,17 @@
         ORDER BY task_id LIMIT 1
     </select>
 
+    <select id="findTaskForEffort" resultType="long">
+        SELECT binding.task_id FROM yunxiao_binding binding
+        WHERE binding.scope = #{binding.scope} AND binding.child_id = #{binding.childId}
+        ORDER BY EXISTS (
+            SELECT 1 FROM yunxiao_write write_state
+            WHERE write_state.task_id = binding.task_id AND write_state.scope = binding.scope
+              AND write_state.operation = #{operation}
+        ) DESC, binding.task_id
+        LIMIT 1
+    </select>
+
     <select id="findChildTimerTask" resultType="long">
         SELECT task_id FROM yunxiao_timer_task
         WHERE scope = #{scope} AND parent_id = #{parentId} AND display_title = #{title}

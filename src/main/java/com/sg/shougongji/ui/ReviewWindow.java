@@ -241,7 +241,7 @@ final class ReviewWindow {
         }
         timelineTab.setSelected(true);
 
-        Button weeklyEffort = button("本周云效工时", "sidebar-link");
+        Button weeklyEffort = button("云效周工时", "sidebar-link");
         weeklyEffort.setGraphic(icon("M2 4 H12 V12 H2 Z M2 6.5 H12 M5 2 V4 M9 2 V4 M5 9 H9"));
         weeklyEffort.setMaxWidth(Double.MAX_VALUE);
         weeklyEffort.setOnAction(event -> perform(stage, () -> yunxiao.showWeek(stage, LocalDate.now(clock))));

@@ -1,15 +1,18 @@
 package com.sg.shougongji.ui;
 
 import com.sg.shougongji.model.Yunxiao.ApiException;
+import com.sg.shougongji.model.Yunxiao.Binding;
 import com.sg.shougongji.model.Yunxiao.ProtocolException;
 import com.sg.shougongji.model.YunxiaoWeek;
 import com.sg.shougongji.service.YunxiaoService;
 import javafx.beans.binding.Bindings;
+import javafx.beans.property.SimpleBooleanProperty;
 import javafx.concurrent.Task;
 import javafx.geometry.Pos;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonBar;
 import javafx.scene.control.ButtonType;
+import javafx.scene.control.ComboBox;
 import javafx.scene.control.ContentDisplay;
 import javafx.scene.control.Dialog;
 import javafx.scene.control.Label;
@@ -48,9 +51,12 @@ final class YunxiaoWeekDialog {
     private static final DateTimeFormatter SHORT_DATE = DateTimeFormatter.ofPattern("M/d");
 
     private final YunxiaoService connection;
+    private final YunxiaoDialogs yunxiao;
     private final LocalDate today;
-    private final LocalDate monday;
+    private final LocalDate currentMonday;
     private final Dialog<ButtonType> dialog = new Dialog<>();
+    private final ComboBox<String> weekPicker = new ComboBox<>();
+    private final Label weekRange = label("", "muted");
     private final GridPane weekDays = new GridPane();
     private final VBox dayDetails = new VBox();
     private final VBox otherRecords = new VBox(6);
@@ -58,17 +64,22 @@ final class YunxiaoWeekDialog {
     private final Label total = label("—", "week-total");
     private final Label account = label("", "section-title");
     private final Label status = label("", "muted", "wrap");
+    private final Label registrationNotice = label("", "muted", "wrap");
     private final Button refresh = button("刷新", "secondary");
+    private final SimpleBooleanProperty loading = new SimpleBooleanProperty();
+    private final SimpleBooleanProperty registering = new SimpleBooleanProperty();
     private LocalDate selectedDate;
     private Task<YunxiaoWeek> request;
+    private int requestRevision;
 
-    YunxiaoWeekDialog(Window owner, YunxiaoService connection, LocalDate today) {
+    YunxiaoWeekDialog(Window owner, YunxiaoService connection, LocalDate today, YunxiaoDialogs yunxiao) {
         this.connection = connection;
+        this.yunxiao = yunxiao;
         this.today = today;
-        monday = today.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY));
+        currentMonday = today.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY));
         dialog.initOwner(owner);
-        dialog.setTitle("本周云效工时");
-        dialog.setHeaderText("本周云效工时");
+        dialog.setTitle("云效周工时");
+        dialog.setHeaderText("云效周工时");
         dialog.setResizable(true);
         styleDialog(dialog, 740);
         dialog.getDialogPane().getStyleClass().add("yunxiao-week");
@@ -77,17 +88,42 @@ final class YunxiaoWeekDialog {
             window.setMinWidth(620);
             window.setMinHeight(420);
         });
-        dialog.getDialogPane().getButtonTypes().add(new ButtonType("关闭", ButtonBar.ButtonData.CANCEL_CLOSE));
-        dialog.setOnHidden(event -> {
-            if (request != null) {
-                request.cancel();
+        ButtonType close = new ButtonType("关闭", ButtonBar.ButtonData.CANCEL_CLOSE);
+        dialog.getDialogPane().getButtonTypes().add(close);
+        dialog.getDialogPane().lookupButton(close).disableProperty().bind(registering);
+        dialog.setOnCloseRequest(event -> {
+            if (registering.get()) {
+                event.consume();
             }
         });
+        dialog.setOnHidden(event -> {
+            cancelRequest();
+            resetRegistration();
+        });
 
+        weekPicker.getItems().setAll("本周", "上周", "上上周");
+        weekPicker.getSelectionModel().selectFirst();
+        weekPicker.setAccessibleText("选择周次");
+        weekPicker.disableProperty().bind(registering);
+        weekDays.disableProperty().bind(registering);
+        weekPicker.getSelectionModel().selectedIndexProperty().addListener((property, before, after) -> {
+            selectedDate = null;
+            registrationNotice.setText("");
+            load();
+        });
+        refresh.disableProperty().bind(loading.or(registering));
         refresh.setOnAction(event -> load());
-        HBox header = new HBox(8, label(monday + " 至 " + monday.plusDays(6), "muted"), spacer(), refresh);
+        Button directEffort = button("补登其他任务…", "secondary");
+        directEffort.disableProperty().bind(registering);
+        directEffort.setOnAction(event -> {
+            LocalDate monday = weekStart();
+            LocalDate day = selectedDate != null ? selectedDate : monday.equals(currentMonday) ? today : monday;
+            yunxiao.showDirectEffort(dialog.getDialogPane().getScene().getWindow(), connection, day, this::load);
+        });
+        HBox header = new HBox(8, weekPicker, weekRange, spacer(), directEffort, refresh);
         header.setAlignment(Pos.CENTER_LEFT);
         status.managedProperty().bind(status.textProperty().isNotEmpty());
+        registrationNotice.managedProperty().bind(registrationNotice.textProperty().isNotEmpty());
         weekDays.setHgap(7);
         weekDays.setMinHeight(92);
         for (int day = 0; day < 7; day++) {
@@ -103,13 +139,13 @@ final class YunxiaoWeekDialog {
         scroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
         scroll.setPrefViewportHeight(225);
         VBox.setVgrow(scroll, Priority.ALWAYS);
-        dialog.getDialogPane().setContent(new VBox(10, header, createOverview(), status, weekDays, scroll));
+        dialog.getDialogPane().setContent(new VBox(10, header, createOverview(), status, weekDays, registrationNotice, scroll));
     }
 
     private HBox createOverview() {
         HBox amount = new HBox(5, total, label("小时", "muted"));
         amount.setAlignment(Pos.BASELINE_LEFT);
-        VBox metric = new VBox(2, label("本周逐日合计", "muted"), amount);
+        VBox metric = new VBox(2, label("逐日合计", "muted"), amount);
         account.managedProperty().bind(account.textProperty().isNotEmpty());
         account.setMinWidth(0);
         VBox scope = new VBox(4, account, label("已关联工作项 · 本人实际工时", "muted"));
@@ -126,7 +162,12 @@ final class YunxiaoWeekDialog {
     }
 
     private void load() {
-        refresh.setDisable(true);
+        cancelRequest();
+        int revision = requestRevision;
+        LocalDate monday = weekStart();
+        weekRange.setText(monday + " 至 " + monday.plusDays(6));
+        loading.set(true);
+        resetRegistration();
         weekDays.getChildren().clear();
         dayDetails.getChildren().clear();
         otherRecords.getChildren().clear();
@@ -134,12 +175,18 @@ final class YunxiaoWeekDialog {
         account.setText("");
         status.setText("正在读取云效工时…");
         request = background(() -> connection.weekEffort(monday), week -> {
+            if (revision != requestRevision) {
+                return;
+            }
             request = null;
-            refresh.setDisable(false);
+            loading.set(false);
             render(week);
         }, error -> {
+            if (revision != requestRevision) {
+                return;
+            }
             request = null;
-            refresh.setDisable(false);
+            loading.set(false);
             status.setText(switch (error) {
                 case SQLException failure -> "无法读取本地的工作项关联。";
                 case ProtocolException failure -> "无法识别云效返回的账号信息。";
@@ -147,6 +194,18 @@ final class YunxiaoWeekDialog {
                 default -> YunxiaoDialogs.errorText(error);
             });
         });
+    }
+
+    private LocalDate weekStart() {
+        return currentMonday.minusWeeks(weekPicker.getSelectionModel().getSelectedIndex());
+    }
+
+    private void cancelRequest() {
+        requestRevision++;
+        if (request != null) {
+            request.cancel();
+            request = null;
+        }
     }
 
     private void render(YunxiaoWeek week) {
@@ -165,7 +224,7 @@ final class YunxiaoWeekDialog {
                 status.setText("汇总可能不完整。未能读取 " + unavailable + " 个工作项，"
                         + week.unreadableRecords() + " 条记录缺少有效信息。");
             }
-            showDays(week.days());
+            showDays(week.days(), week.workItems());
             if (!week.multiDay().isEmpty()) {
                 VBox spanning = new VBox(8, label("跨日记录按原登记区间显示，逐日合计统计单日登记。", "muted", "wrap"));
                 week.multiDay().forEach(registration -> spanning.getChildren().add(registrationRow(registration, true)));
@@ -179,12 +238,14 @@ final class YunxiaoWeekDialog {
         }
     }
 
-    private void showDays(List<YunxiaoWeek.Day> days) {
+    private void showDays(List<YunxiaoWeek.Day> days, List<Binding> workItems) {
         LocalDate preferred = selectedDate;
         if (preferred == null) {
+            LocalDate firstDate = days.getFirst().date();
+            LocalDate fallback = firstDate.equals(currentMonday) ? today : firstDate;
             preferred = days.stream().filter(day -> !day.records().isEmpty() && day.date().equals(today))
                     .map(YunxiaoWeek.Day::date).findFirst().orElseGet(() -> days.reversed().stream()
-                            .filter(day -> !day.records().isEmpty()).map(YunxiaoWeek.Day::date).findFirst().orElse(today));
+                            .filter(day -> !day.records().isEmpty()).map(YunxiaoWeek.Day::date).findFirst().orElse(fallback));
         }
         ToggleGroup selection = new ToggleGroup();
         for (int index = 0; index < days.size(); index++) {
@@ -193,8 +254,11 @@ final class YunxiaoWeekDialog {
             card.setToggleGroup(selection);
             card.selectedProperty().addListener((property, before, selected) -> {
                 if (selected) {
+                    if (!day.date().equals(selectedDate)) {
+                        registrationNotice.setText("");
+                    }
                     selectedDate = day.date();
-                    showDayDetails(day);
+                    showDayDetails(day, workItems);
                 }
             });
             weekDays.add(card, index, 0);
@@ -228,17 +292,31 @@ final class YunxiaoWeekDialog {
         return card;
     }
 
-    private void showDayDetails(YunxiaoWeek.Day day) {
+    private void showDayDetails(YunxiaoWeek.Day day, List<Binding> workItems) {
+        resetRegistration();
+        var editor = yunxiao.weekEffortForm(connection, day.date(), workItems, message -> {
+            if (dialog.isShowing()) {
+                registrationNotice.setText(message);
+                load();
+            }
+        });
+        registering.bind(editor.busy());
+        editor.content().getStyleClass().add("week-registration");
         HBox heading = new HBox(8, label(DAY.format(day.date()), "section-title"), spacer(),
                 label(hours(day.hours()), "entry-duration"));
         heading.setAlignment(Pos.CENTER_LEFT);
-        dayDetails.getChildren().setAll(heading);
+        dayDetails.getChildren().setAll(heading, editor.content());
         if (day.records().isEmpty()) {
             dayDetails.getChildren().add(label("当天没有登记工时。", "week-empty", "muted"));
         } else {
             day.records().forEach(registration -> dayDetails.getChildren().add(registrationRow(registration, false)));
         }
         scroll.setVvalue(0);
+    }
+
+    private void resetRegistration() {
+        registering.unbind();
+        registering.set(false);
     }
 
     private static VBox registrationRow(YunxiaoWeek.Registration registration, boolean spanning) {

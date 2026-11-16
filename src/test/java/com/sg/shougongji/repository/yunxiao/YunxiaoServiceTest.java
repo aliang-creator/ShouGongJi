@@ -87,6 +87,7 @@ class YunxiaoServiceTest {
         YunxiaoWeek week = sync.weekEffort(LocalDate.of(2026, 11, 12));
         assertEquals("本人", week.accountName());
         assertEquals(2, week.workItemCount());
+        assertEquals(List.of(bindings.getFirst(), bindings.get(2)), week.workItems());
         assertEquals(1, week.unavailableItems().size());
         assertTrue(week.unavailableItems().getFirst().startsWith("项目 / B"));
         assertEquals(1, week.unreadableRecords());
@@ -99,6 +100,85 @@ class YunxiaoServiceTest {
         assertEquals(new BigDecimal("1.75"), week.dailyHours());
         assertEquals(1, week.multiDay().size());
         assertEquals(new BigDecimal("9"), week.multiDay().getFirst().hours());
+        cloud.assertDone();
+    }
+
+    @Test
+    void registersHoursForTheSelectedPastDateWithoutALocalSessionAndReusesItsOriginalRecord() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoRepository repository = open();
+        YunxiaoService sync = new YunxiaoService(repository, cloud.central());
+        Binding binding = new Binding(sync.scope(), "item-a", "项目 / A");
+        repository.taskForExistingItem(binding, "关联事项");
+        long otherTask = task();
+        repository.bind(otherTask, binding);
+        LocalDate monday = LocalDate.of(2026, 11, 9);
+        LocalDate tuesday = monday.plusDays(1);
+        PendingWrite oldWrite = repository.reserveWrite(otherTask, sync.scope(), "effort:item-a:" + tuesday);
+        repository.completeWrite(oldWrite.marker(), "tuesday-record");
+
+        cloud.answer("POST", "/workitems/item-a/effortRecords", request -> {
+            JsonObject body = body(request);
+            assertEquals(monday.toString(), body.get("gmtStart").getAsString());
+            assertEquals(monday.toString(), body.get("gmtEnd").getAsString());
+            assertEquals(new BigDecimal("1.5"), body.get("actualTime").getAsBigDecimal());
+            return response(request, 201, "{\"id\":\"monday-record\"}");
+        });
+        sync.registerLinkedEffort(binding, monday, new BigDecimal("1.5"), false, false);
+
+        cloud.answer("PUT", "/workitems/item-a/effortRecords/tuesday-record", request -> {
+            JsonObject body = body(request);
+            assertEquals(tuesday.toString(), body.get("gmtStart").getAsString());
+            assertEquals(tuesday.toString(), body.get("gmtEnd").getAsString());
+            assertEquals(new BigDecimal("2"), body.get("actualTime").getAsBigDecimal());
+            return response(request, 204, "");
+        });
+        sync.registerLinkedEffort(binding, tuesday, new BigDecimal("2"), false, false);
+        assertThrows(IllegalArgumentException.class, () -> sync.registerLinkedEffort(
+                new Binding(sync.scope(), "unlinked-item", "未关联"), monday, BigDecimal.ONE, false, false));
+        cloud.assertDone();
+    }
+
+    @Test
+    void findsAndRegistersAnUnlinkedCloudTaskWithoutCreatingLocalHours() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoRepository repository = open();
+        YunxiaoService sync = new YunxiaoService(repository, cloud.central());
+        Choice project = new Choice("project-1", "项目一");
+        LocalDate day = LocalDate.of(2026, 11, 9);
+        cloud.answer("POST", "/workitems:search", request -> {
+            JsonObject query = body(request);
+            assertEquals(project.id(), query.get("spaceId").getAsString());
+            assertEquals("Task", query.get("category").getAsString());
+            return response(request, 200, """
+                    [{"id":"task-1","subject":"导出","serialNumber":"PRJ-1","categoryId":"Task",
+                      "space":{"id":"project-1"}},
+                     {"id":"task-2","subject":"导出核对","serialNumber":"PRJ-2","categoryId":"Task",
+                      "space":{"id":"project-1"},"parentId":"req-1"}]
+                    """);
+        });
+        List<Item> items = sync.timerItems(project.id(), WorkItemKind.TASK, "导出", 1).items();
+        assertEquals(List.of("task-1", "task-2"), items.stream().map(Item::id).toList());
+        assertTrue(repository.findBindings().isEmpty());
+
+        Item task = items.getLast();
+        cloud.answer("POST", "/workitems/task-2/effortRecords", request -> {
+            JsonObject body = body(request);
+            assertEquals(day.toString(), body.get("gmtStart").getAsString());
+            assertEquals(day.toString(), body.get("gmtEnd").getAsString());
+            assertEquals(new BigDecimal("1.5"), body.get("actualTime").getAsBigDecimal());
+            return response(request, 201, "{\"id\":\"direct-record\"}");
+        });
+        sync.registerTaskEffort(project, task, day, new BigDecimal("1.5"), false, false);
+        assertEquals(List.of("task-2"), repository.findBindings().values().stream().map(Binding::childId).toList());
+        assertTrue(servicesAt(Instant.parse("2026-11-16T03:00:00Z")).review().loadDay(day).entries().isEmpty());
+
+        cloud.answer("PUT", "/workitems/task-2/effortRecords/direct-record", request -> {
+            assertEquals(BigDecimal.valueOf(2), body(request).get("actualTime").getAsBigDecimal());
+            return response(request, 204, "");
+        });
+        sync.registerTaskEffort(project, task, day, BigDecimal.valueOf(2), false, false);
+        assertEquals(1, repository.findBindings().size());
         cloud.assertDone();
     }
 
@@ -595,6 +675,55 @@ class YunxiaoServiceTest {
     }
 
     @Test
+    void createsAParentRequirementAndBindsOnlyTheChildTask() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoRepository repository = open();
+        YunxiaoService sync = new YunxiaoService(repository, cloud.central());
+        long task = task();
+        Choice project = new Choice("project-1", "项目一");
+        cloud.answer("GET", "/projects/project-1/workitemTypes?category=Req", """
+                [{"id":"disabled","name":"已停用","enable":false},
+                 {"id":"req-type","name":"技术需求","enable":true,"defaultType":true}]
+                """);
+        Choice type = sync.requirementTypes(project.id()).getFirst();
+        assertEquals(new Choice("req-type", "技术需求"), type);
+
+        cloud.answer("POST", "/workitems", request -> response(request, 503, "{}"));
+        assertThrows(ApiException.class, () -> sync.createRequirement(task, project, type.id(), "新需求",
+                "member-1", "背景说明", Map.of("priority", "p2"), false));
+        assertThrows(YunxiaoService.UncertainWrite.class, () -> sync.createRequirement(task, project, type.id(),
+                "新需求", "member-1", "背景说明", Map.of("priority", "p2"), false));
+
+        cloud.answer("POST", "/workitems", request -> {
+            JsonObject body = body(request);
+            assertEquals(project.id(), body.get("spaceId").getAsString());
+            assertEquals(type.id(), body.get("workitemTypeId").getAsString());
+            assertEquals("新需求", body.get("subject").getAsString());
+            assertEquals("背景说明", body.get("description").getAsString());
+            assertEquals("member-1", body.get("assignedTo").getAsString());
+            assertEquals("p2", body.getAsJsonObject("customFieldValues").get("priority").getAsString());
+            assertFalse(body.has("parentId"));
+            return response(request, 201, "{\"id\":\"new-requirement\"}");
+        });
+        Item parent = sync.createRequirement(task, project, type.id(), "新需求", "member-1", "背景说明",
+                Map.of("priority", "p2"), true);
+        assertTrue(WorkItemKind.REQUIREMENT.matches(parent));
+        assertEquals("new-requirement", parent.id());
+        assertEquals(parent, sync.createRequirement(task, project, type.id(), "新需求", "member-1", "背景说明",
+                Map.of("priority", "p2"), false));
+        assertNull(repository.findBinding(task));
+
+        cloud.answer("POST", "/workitems", request -> {
+            assertEquals(parent.id(), body(request).get("parentId").getAsString());
+            return response(request, 201, "{\"id\":\"new-child\"}");
+        });
+        Binding child = sync.create(task, project, parent, "task-type", "子任务", "member-1", Map.of(), false);
+        assertEquals("new-child", child.childId());
+        assertEquals(child, repository.findBinding(task));
+        cloud.assertDone();
+    }
+
+    @Test
     void sendsThePriorityOptionIdFromTheProjectTemplate() throws Exception {
         Cloud cloud = new Cloud();
         YunxiaoClient client = cloud.central();
@@ -618,7 +747,7 @@ class YunxiaoServiceTest {
                     .get("priority").getAsString());
             return response(request, 201, "{\"id\":\"created-task\"}");
         });
-        assertEquals("created-task", client.createTask("project-1", null, "task-type", "任务标题",
+        assertEquals("created-task", client.createWorkItem("project-1", null, "task-type", "任务标题",
                 "member-1", "", Map.of(priority.id(), priority.options().getFirst().id())));
         cloud.assertDone();
     }

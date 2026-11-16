@@ -445,9 +445,13 @@ public final class DesktopApplication extends Application {
         Button cloud = button(CLOUD_START_LABEL, "subtle");
         cloud.setOnAction(event -> perform(timerStage,
                 () -> startCloudTask(timerStage, taskInput.getText(), ignored -> {})));
+        Button cloudEffort = button("补登工时…", "subtle");
+        cloudEffort.setAccessibleText("补登云效工时");
+        cloudEffort.setOnAction(event -> perform(timerStage, () -> yunxiao.showDirectEffort(timerStage,
+                LocalDate.now(clock), () -> perform(timerStage, this::refresh))));
         cloudSync.managedProperty().bind(cloudSync.visibleProperty());
         cloudSync.setOnAction(event -> perform(timerStage, () -> retryAutoSync(timerStage)));
-        HBox cloudActions = new HBox(4, cloud, spacer(), cloudSync);
+        HBox cloudActions = new HBox(4, cloud, cloudEffort, spacer(), cloudSync);
         cloudActions.setAlignment(Pos.CENTER_LEFT);
         return new VBox(3, composer, cloudActions);
     }

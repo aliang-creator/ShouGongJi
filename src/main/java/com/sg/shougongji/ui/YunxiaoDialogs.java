@@ -17,7 +17,10 @@ import com.sg.shougongji.service.YunxiaoService;
 import com.sg.shougongji.service.YunxiaoSettingsService;
 import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
+import javafx.beans.binding.ObjectExpression;
 import javafx.beans.property.SimpleBooleanProperty;
+import javafx.beans.property.SimpleObjectProperty;
+import javafx.beans.value.ObservableBooleanValue;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.collections.transformation.FilteredList;
@@ -30,6 +33,7 @@ import javafx.scene.control.ButtonBar;
 import javafx.scene.control.ButtonType;
 import javafx.scene.control.CheckBox;
 import javafx.scene.control.ComboBox;
+import javafx.scene.control.DatePicker;
 import javafx.scene.control.Dialog;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListView;
@@ -76,6 +80,8 @@ final class YunxiaoDialogs {
 
     private final YunxiaoSettingsService settings;
     private final Consumer<String> openPage;
+    private final Map<String, String> recentEffortWorkItems = new LinkedHashMap<>();
+    private final Map<String, Choice> recentEffortProjects = new LinkedHashMap<>();
 
     YunxiaoDialogs(YunxiaoSettingsService settings, Consumer<String> openPage) {
         this.settings = settings;
@@ -159,9 +165,27 @@ final class YunxiaoDialogs {
     void showWeek(Window owner, LocalDate today) throws SQLException {
         YunxiaoService connection = connection(owner);
         if (connection != null) {
-            new YunxiaoWeekDialog(owner, connection, today).show();
+            new YunxiaoWeekDialog(owner, connection, today, this).show();
         }
     }
+
+    void showDirectEffort(Window owner, LocalDate day, Runnable onChanged) throws SQLException {
+        YunxiaoService connection = connection(owner);
+        if (connection != null) {
+            showDirectEffort(owner, connection, day, onChanged);
+        }
+    }
+
+    void showDirectEffort(Window owner, YunxiaoService connection, LocalDate day, Runnable onChanged) {
+        new WorkDialog(owner, connection, null, day, null).showDirectEffort(onChanged);
+    }
+
+    WeekEffortForm weekEffortForm(YunxiaoService connection, LocalDate day, List<Binding> workItems,
+                                  Consumer<String> onRecorded) {
+        return new WorkDialog(connection, null, day, null).weekEffortForm(workItems, onRecorded);
+    }
+
+    record WeekEffortForm(VBox content, ObservableBooleanValue busy) {}
 
     void create(Window owner, DayReview.Entry entry, LocalDate day, Consumer<Binding> onBound) throws SQLException {
         showBindingDialog(owner, entry, day, true, onBound);
@@ -484,7 +508,7 @@ final class YunxiaoDialogs {
 
         EffortOverlay effortOverlay(Binding binding, Consumer<EffortOverlay> onClose, Runnable onChanged) {
             body.getStyleClass().add("effort-form");
-            TextField hours = submitForm(binding);
+            TextField hours = submitForm(new SimpleObjectProperty<>(linkedEffortTarget(binding)), null, message -> {});
             EffortOverlay overlay = new EffortOverlay(body, busy, closed -> {
                 onClose.accept(closed);
                 if (changed) {
@@ -497,6 +521,37 @@ final class YunxiaoDialogs {
                 }
             });
             return overlay;
+        }
+
+        WeekEffortForm weekEffortForm(List<Binding> workItems, Consumer<String> onRecorded) {
+            Map<String, Binding> byId = new LinkedHashMap<>();
+            ComboBox<Choice> picker = new ComboBox<>();
+            for (Binding workItem : workItems) {
+                byId.put(workItem.childId(), workItem);
+                picker.getItems().add(new Choice(workItem.childId(), workItem.label()));
+            }
+            picker.setPromptText("请选择已关联的工作项");
+            String recent = recentEffortWorkItems.get(connection.scope());
+            Binding preferred = byId.get(recent);
+            if (preferred != null) {
+                picker.setValue(new Choice(preferred.childId(), preferred.label()));
+            } else if (workItems.size() == 1) {
+                picker.getSelectionModel().selectFirst();
+            } else {
+                recentEffortWorkItems.remove(connection.scope());
+            }
+            var target = Bindings.createObjectBinding(() -> {
+                Choice selected = picker.getValue();
+                return selected == null ? null : linkedEffortTarget(byId.get(selected.id()));
+            }, picker.valueProperty());
+            TextField hours = submitForm(target, picker, onRecorded);
+            Node focus = picker.getValue() == null ? picker : hours;
+            Platform.runLater(() -> {
+                if (focus.getScene() != null) {
+                    focus.requestFocus();
+                }
+            });
+            return new WeekEffortForm(body, busy);
         }
 
         void showBindingDialog(boolean create, Consumer<Binding> onBound) throws SQLException {
@@ -515,6 +570,11 @@ final class YunxiaoDialogs {
             dialog.show();
         }
 
+        void showRequirement(Assignee saved, RequirementCreation requirement) {
+            new CreationForm(saved, null, "", null, requirement).show();
+            dialog.show();
+        }
+
         void showTimer(String initialTitle, Consumer<Boolean> onClosed) throws SQLException {
             dialog.setTitle("云效计时");
             dialog.setHeaderText("从云效工作项开始计时");
@@ -525,6 +585,85 @@ final class YunxiaoDialogs {
                 onClosed.accept(started);
             });
             dialog.show();
+        }
+
+        void showDirectEffort(Runnable onChanged) {
+            dialog.setTitle("补登云效工时");
+            dialog.setHeaderText("补登云效工时");
+            DatePicker date = new DatePicker(day);
+            date.setEditable(false);
+            Picker<Choice> projects = new Picker<>();
+            projects.combo.setPromptText("选择云效项目");
+            Picker<Item> tasks = new Picker<>();
+            tasks.combo.setPromptText("选择任务或子任务");
+            TextField query = new TextField();
+            query.setPromptText("输入任务标题或完整编号");
+            HBox.setHgrow(query, Priority.ALWAYS);
+            Button search = button("搜索", "secondary");
+            search.disableProperty().bind(projects.combo.valueProperty().isNull());
+            query.disableProperty().bind(search.disableProperty());
+            Runnable findTask = () -> searchEffortTasks(projects.combo.getValue(), query.getText(), tasks, true);
+            search.setOnAction(event -> findTask.run());
+            query.setOnAction(event -> findTask.run());
+            projects.combo.valueProperty().addListener((observable, old, project) -> {
+                if (project != null) {
+                    recentEffortProjects.put(connection.scope(), project);
+                    searchEffortTasks(project, query.getText(), tasks, false);
+                } else {
+                    tasks.clear();
+                }
+            });
+            var target = Bindings.createObjectBinding(() -> {
+                Choice project = projects.combo.getValue();
+                Item item = tasks.combo.getValue();
+                LocalDate selected = date.getValue();
+                if (project == null || item == null || selected == null || !project.id().equals(item.projectId())) {
+                    return null;
+                }
+                return new EffortTarget(item.id(), item.toString(), selected, (hours, retryConfirmed, verify) ->
+                        connection.registerTaskEffort(project, item, selected, hours, retryConfirmed, verify));
+            }, projects.combo.valueProperty(), tasks.combo.valueProperty(), date.valueProperty());
+            TextField hours = submitForm(target, null, message -> {});
+            tasks.combo.valueProperty().addListener((observable, old, task) -> {
+                if (task != null) {
+                    Platform.runLater(hours::requestFocus);
+                }
+            });
+            VBox projectField = field("项目", projects.row);
+            projectField.setMinWidth(0);
+            HBox.setHgrow(projectField, Priority.ALWAYS);
+            HBox context = new HBox(8, field("登记日期", date), projectField);
+            content.getChildren().addAll(0, List.of(context, new HBox(8, query, search), field("云效任务", tasks.row)));
+            showWhenChanged(onChanged);
+            projects.load(1, connection::projects, loaded -> {
+                if (projects.combo.getValue() != null) {
+                    return;
+                }
+                Choice recent = recentEffortProjects.get(connection.scope());
+                if (projects.combo.getItems().contains(recent)) {
+                    projects.combo.setValue(recent);
+                } else if (loaded.next() == 0 && projects.combo.getItems().size() == 1) {
+                    projects.combo.getSelectionModel().selectFirst();
+                }
+            });
+        }
+
+        private void searchEffortTasks(Choice project, String query, Picker<Item> tasks, boolean showResults) {
+            tasks.clear();
+            tasks.load(1, page -> connection.timerItems(project.id(), WorkItemKind.TASK, query, page), loaded -> {
+                if (tasks.combo.getValue() != null || tasks.combo.getItems().isEmpty()) {
+                    return;
+                }
+                if (loaded.next() == 0 && tasks.combo.getItems().size() == 1) {
+                    tasks.combo.getSelectionModel().selectFirst();
+                } else if (showResults) {
+                    tasks.combo.show();
+                } else if (query.isBlank()) {
+                    String recent = recentEffortWorkItems.get(connection.scope());
+                    tasks.combo.getItems().stream().filter(item -> item.id().equals(recent))
+                            .findFirst().ifPresent(tasks.combo::setValue);
+                }
+            });
         }
 
         void showAutomaticChild(Runnable onLinked) throws SQLException {
@@ -817,7 +956,7 @@ final class YunxiaoDialogs {
             private final TextField title;
             private final TextArea description = new TextArea();
             private final ComboBox<Choice> types = new ComboBox<>();
-            private final Label typeHint = label("任务类型随归属项目变化。", "muted", "wrap");
+            private final Label typeHint = label("工作项类型随归属项目变化。", "muted", "wrap");
             private final ComboBox<Choice> assignees = new ComboBox<>();
             private final Label assigneeHint = label("", "muted", "wrap");
             private Assignee preferredAssignee;
@@ -826,6 +965,7 @@ final class YunxiaoDialogs {
             private final SimpleBooleanProperty ready = new SimpleBooleanProperty();
             private final ParentSelection selection;
             private final Runnable back;
+            private final RequirementCreation requirement;
             private boolean descriptionRequired;
 
             CreationForm(Assignee saved) {
@@ -833,12 +973,22 @@ final class YunxiaoDialogs {
             }
 
             CreationForm(Assignee saved, ParentSelection selection, String initialTitle, Runnable back) {
+                this(saved, selection, initialTitle, back, null);
+            }
+
+            CreationForm(Assignee saved, ParentSelection selection, String initialTitle, Runnable back,
+                         RequirementCreation requirement) {
                 preferredAssignee = saved;
                 this.selection = selection;
                 this.back = back;
+                this.requirement = requirement;
                 title = new TextField(initialTitle);
-                ButtonType action = selection == null ? createTask
-                        : new ButtonType("开始计时", ButtonBar.ButtonData.OK_DONE);
+                ButtonType action = createTask;
+                if (requirement != null) {
+                    action = new ButtonType("创建需求", ButtonBar.ButtonData.OK_DONE);
+                } else if (selection != null) {
+                    action = new ButtonType("开始计时", ButtonBar.ButtonData.OK_DONE);
+                }
                 dialog.getDialogPane().getButtonTypes().addFirst(action);
                 Button create = (Button) dialog.getDialogPane().lookupButton(action);
                 create.disableProperty().bind(content.disableProperty().or(ready.not())
@@ -854,7 +1004,7 @@ final class YunxiaoDialogs {
             }
 
             void show() {
-                String heading = selection == null ? "新建云效任务" : "子任务计时";
+                String heading = requirement != null ? "新建父需求" : selection == null ? "新建云效任务" : "子任务计时";
                 dialog.setTitle(heading);
                 dialog.setHeaderText(heading);
                 dialog.getDialogPane().setPrefWidth(720);
@@ -862,14 +1012,10 @@ final class YunxiaoDialogs {
                 parents.combo.setPromptText("选择父需求");
                 types.setPromptText("选择工作项类型");
                 assignees.setPromptText("选择负责人");
-                description.setPromptText("补充任务背景、结果或验收要求");
+                description.setPromptText(requirement == null ? "补充任务背景、结果或验收要求" : "补充需求背景、目标或验收要求");
                 description.setWrapText(true);
                 description.setPrefRowCount(8);
 
-                VBox parentField = field("父需求", parents.row);
-                parentField.visibleProperty().bind(useParent.selectedProperty());
-                parentField.managedProperty().bind(parentField.visibleProperty());
-                useParent.disableProperty().bind(projects.combo.valueProperty().isNull());
                 VBox draft = new VBox(10);
                 if (selection != null) {
                     draft.getChildren().add(field("父工作项", label(selection.item().toString(), "section-title", "wrap")));
@@ -880,41 +1026,76 @@ final class YunxiaoDialogs {
                     draft.getChildren().add(titleActions());
                 }
                 draft.getChildren().add(field("描述（支持 Markdown）", description));
-                draft.getChildren().add(label("计划开始和完成均为 " + day, "muted"));
-                if (selection == null) {
-                    draft.getChildren().add(label("新建后会关联到当前事项，工时可在下一步核对并提交。", "muted", "wrap"));
-                } else {
-                    draft.getChildren().add(label("首次结束时创建子任务并登记工时，之后继续计时会更新当天累计。",
-                            "muted", "wrap"));
+                if (requirement == null) {
+                    draft.getChildren().add(label("计划开始和完成均为 " + day, "muted"));
+                    draft.getChildren().add(label(selection == null
+                            ? "新建后会关联到当前事项，工时可在下一步核对并提交。"
+                            : "首次结束时创建子任务并登记工时，之后继续计时会更新当天累计。", "muted", "wrap"));
                 }
                 draft.setMinWidth(200);
                 HBox.setHgrow(draft, Priority.ALWAYS);
                 VBox typeField = field("工作项类型", types);
                 typeField.getChildren().add(typeHint);
                 VBox fields = new VBox(9, label("基础字段", "section-title"));
-                if (selection == null) {
+                if (requirement != null) {
+                    fields.getChildren().add(field("归属项目", label(requirement.project().name(), "wrap")));
+                } else if (selection == null) {
                     fields.getChildren().add(field("归属项目", projects.row));
                 }
                 fields.getChildren().addAll(typeField, createAssigneeField(), extra);
-                if (selection == null) {
-                    fields.getChildren().addAll(useParent, parentField);
+                if (selection == null && requirement == null) {
+                    fields.getChildren().addAll(useParent, createParentField());
                 }
                 fields.setPrefWidth(265);
                 fields.setMinWidth(210);
                 HBox form = new HBox(18, draft, fields);
                 if (selection == null) {
                     content.getChildren().setAll(form);
-                    connectFieldChanges();
-                    projects.load(1, connection::projects);
+                    if (requirement != null) {
+                        projects.combo.setValue(requirement.project());
+                    }
                 } else {
                     Button returnToItems = button("返回工作项", "subtle");
                     returnToItems.setOnAction(event -> back.run());
                     content.getChildren().setAll(returnToItems, form);
                     projects.combo.setValue(selection.project());
                     parents.combo.setValue(selection.item());
-                    connectFieldChanges();
+                }
+                connectFieldChanges();
+                if (requirement != null) {
+                    loadOptions(requirement.project(), null);
+                } else if (selection == null) {
+                    projects.load(1, connection::projects);
+                } else {
                     loadOptions(selection.project(), selection.types());
                 }
+            }
+
+            private VBox createParentField() {
+                VBox parentField = field("父需求", parents.row);
+                parentField.visibleProperty().bind(useParent.selectedProperty());
+                parentField.managedProperty().bind(parentField.visibleProperty());
+                useParent.disableProperty().bind(projects.combo.valueProperty().isNull());
+                Button create = button("新建父需求…", "subtle");
+                HBox header = new HBox(5, parentField.getChildren().removeFirst(), spacer(), create);
+                header.setAlignment(Pos.CENTER_LEFT);
+                parentField.getChildren().addFirst(header);
+                create.setOnAction(event -> {
+                    Window owner = dialog.getDialogPane().getScene().getWindow();
+                    Choice project = projects.combo.getValue();
+                    new WorkDialog(owner, connection, null, day, null).showRequirement(preferredAssignee,
+                            new RequirementCreation(entry.task().id(), project, this::selectCreatedRequirement));
+                });
+                return parentField;
+            }
+
+            private void selectCreatedRequirement(Item created) {
+                Item selected = parents.combo.getItems().stream().filter(item -> item.id().equals(created.id()))
+                        .findFirst().orElseGet(() -> {
+                            parents.combo.getItems().addFirst(created);
+                            return created;
+                        });
+                parents.combo.setValue(selected);
             }
 
             private boolean missingTitle() {
@@ -1001,9 +1182,14 @@ final class YunxiaoDialogs {
             }
 
             private void loadOptions(Choice project, List<Choice> childTypes) {
-                run("正在读取任务类型和项目成员…", () -> new CreationOptions(
-                        childTypes == null ? connection.taskTypes(project.id()) : childTypes,
-                        connection.members(project.id())), options -> {
+                run("正在读取工作项类型和项目成员…", () -> {
+                    List<Choice> options = childTypes;
+                    if (options == null) {
+                        options = requirement == null ? connection.taskTypes(project.id())
+                                : connection.requirementTypes(project.id());
+                    }
+                    return new CreationOptions(options, connection.members(project.id()));
+                }, options -> {
                     assignees.getItems().setAll(options.members());
                     if (options.members().isEmpty()) {
                         status.setText("没有可用的负责人，请检查项目成员和访问权限。");
@@ -1045,7 +1231,7 @@ final class YunxiaoDialogs {
                 ready.set(false);
                 types.setValue(null);
                 types.getItems().clear();
-                typeHint.setText("任务类型随归属项目变化。");
+                typeHint.setText("工作项类型随归属项目变化。");
                 extra.getChildren().clear();
                 inputs.clear();
             }
@@ -1054,9 +1240,10 @@ final class YunxiaoDialogs {
                 types.getItems().setAll(choices);
                 String scope = parents.combo.getValue() == null
                         ? "「" + projects.combo.getValue().name() + "」" : "当前父项";
-                typeHint.setText(scope + "可选 " + choices.size() + " 种任务类型。");
+                String typeName = requirement == null ? "任务类型" : "需求类型";
+                typeHint.setText(scope + "可选 " + choices.size() + " 种" + typeName + "。");
                 if (choices.isEmpty()) {
-                    status.setText("这里没有可用的任务类型，请检查云效项目配置。");
+                    status.setText("这里没有可用的" + typeName + "，请检查云效项目配置。");
                 } else {
                     types.getSelectionModel().selectFirst();
                 }
@@ -1069,10 +1256,10 @@ final class YunxiaoDialogs {
                 extra.getChildren().clear();
                 descriptionRequired = false;
                 String projectId = projects.combo.getValue().id();
-                run("正在读取任务模板…", () -> connection.creationFields(projectId, type.id()), fields -> {
+                run("正在读取工作项模板…", () -> connection.creationFields(projectId, type.id()), fields -> {
                     List<String> unsupported = new ArrayList<>();
                     for (Field field : fields) {
-                        String plannedDate = field.plannedDate(day);
+                        String plannedDate = requirement == null ? field.plannedDate(day) : "";
                         if (!plannedDate.isBlank()) {
                             inputs.put(field, () -> plannedDate);
                             continue;
@@ -1096,8 +1283,8 @@ final class YunxiaoDialogs {
                     if (unsupported.isEmpty()) {
                         ready.set(true);
                     } else {
-                        status.setText("此模板需要填写「" + String.join("、", unsupported)
-                                + "」。请在云效新建后，再关联已有任务。");
+                        status.setText("此模板需要填写「" + String.join("、", unsupported) + "」。"
+                                + (requirement == null ? "请在云效新建后，再关联已有任务。" : "请在云效新建后，再选择该父需求。"));
                     }
                 });
             }
@@ -1129,7 +1316,7 @@ final class YunxiaoDialogs {
                     return;
                 }
                 if (descriptionRequired && body.isBlank()) {
-                    status.setText("请填写任务描述。");
+                    status.setText("请填写描述。");
                     return;
                 }
                 Map<String, String> custom = new LinkedHashMap<>();
@@ -1147,7 +1334,13 @@ final class YunxiaoDialogs {
                 boolean retryConfirmed = retry.isSelected();
                 resetRetry();
                 Map<String, String> values = Map.copyOf(custom);
-                if (selection == null) {
+                if (requirement != null) {
+                    run("正在新建父需求…", () -> connection.createRequirement(requirement.taskId(), project, type.id(),
+                            subject, assignee.id(), body, values, retryConfirmed), created -> {
+                        dialog.close();
+                        requirement.onCreated().accept(created);
+                    });
+                } else if (selection == null) {
                     run("正在新建云效任务…", () -> connection.create(entry.task().id(), project, parent, type.id(),
                             subject, assignee.id(), body, values, retryConfirmed), WorkDialog.this::showNewBinding);
                 } else {
@@ -1187,11 +1380,25 @@ final class YunxiaoDialogs {
             dialog.close();
         }
 
-        private TextField submitForm(Binding binding) {
+        private EffortTarget linkedEffortTarget(Binding binding) {
+            return new EffortTarget(binding.childId(), binding.label(), day, (hours, retryConfirmed, verify) -> {
+                if (entry == null) {
+                    connection.registerLinkedEffort(binding, day, hours, retryConfirmed, verify);
+                } else if (verify) {
+                    connection.confirmWebEffort(entry.task().id(), binding, day, hours, retryConfirmed);
+                } else {
+                    connection.submit(entry.task().id(), binding, day, hours, retryConfirmed);
+                }
+            });
+        }
+
+        private TextField submitForm(ObjectExpression<EffortTarget> target, ComboBox<Choice> picker,
+                                     Consumer<String> onRecorded) {
             resetRetry();
-            BigDecimal amount = YunxiaoService.effortHours(entry.seconds());
-            TextField hours = new TextField(amount.stripTrailingZeros().toPlainString());
-            Button submit = button("提交工时", "primary");
+            TextField hours = new TextField(entry == null ? ""
+                    : YunxiaoService.effortHours(entry.seconds()).stripTrailingZeros().toPlainString());
+            hours.setPromptText("例如 1.5");
+            Button submit = button(entry == null ? "登记工时" : "提交工时", "primary");
             Label manualHelp = label("", "muted", "wrap");
             Button open = button("在云效打开任务", "secondary");
             Button copy = button("复制登记说明", "secondary");
@@ -1201,34 +1408,43 @@ final class YunxiaoDialogs {
             manual.setVisible(false);
             open.managedProperty().bind(open.visibleProperty());
             copy.managedProperty().bind(copy.visibleProperty());
-            String page = connection.workItemPage(binding.childId());
-            open.setVisible(!page.isBlank());
-            open.setOnAction(event -> openPage.accept(page));
             Consumer<Boolean> save = verify -> {
+                EffortTarget selected = target.get();
+                if (selected == null || busy.get()) {
+                    return;
+                }
                 String input = hours.getText().strip();
                 if (!input.matches("[0-9]{1,4}(\\.[0-9]{1,2})?") || new BigDecimal(input).signum() <= 0) {
                     status.setText("请输入大于 0 的小时数，最多两位小数。");
                     return;
                 }
                 BigDecimal actual = new BigDecimal(input);
+                if (entry == null) {
+                    recentEffortWorkItems.put(connection.scope(), selected.itemId());
+                }
                 boolean retryConfirmed = retry.isSelected();
                 resetRetry();
                 run(verify ? "正在核对云效登记…" : "正在提交工时…", () -> {
-                    if (verify) {
-                        connection.confirmWebEffort(entry.task().id(), binding, day, actual, retryConfirmed);
-                    } else {
-                        connection.submit(entry.task().id(), binding, day, actual, retryConfirmed);
-                    }
+                    selected.save().run(actual, retryConfirmed, verify);
                     return actual;
                 }, saved -> {
                     changed = true;
                     manual.setVisible(false);
-                    status.setText("已同步 " + day + " 的 " + saved.toPlainString() + " 小时。");
+                    if (entry == null) {
+                        hours.clear();
+                    }
+                    String message = "已同步 " + selected.day() + " 的 " + saved.toPlainString() + " 小时。";
+                    status.setText(message);
+                    onRecorded.accept(message);
                 }, failure -> {
                     if (failure instanceof YunxiaoService.PartialSubmission) {
                         changed = true;
+                        onRecorded.accept(errorText(failure));
                     }
                     if (failure instanceof YunxiaoService.ManualEffortRequired required) {
+                        String page = connection.workItemPage(selected.itemId());
+                        open.setVisible(!page.isBlank());
+                        open.setOnAction(event -> openPage.accept(page));
                         String description = required.newRecordDescription();
                         copy.setVisible(!description.isBlank());
                         copy.setOnAction(event -> {
@@ -1248,10 +1464,47 @@ final class YunxiaoDialogs {
             };
             submit.setOnAction(event -> save.accept(false));
             confirm.setOnAction(event -> save.accept(true));
-            content.getChildren().setAll(field("已关联云效任务", label(binding.label(), "section-title", "wrap")),
-                    field("实际工时（小时）", hours),
-                    label("同一事项同一天再次提交会更新原登记。收工记创建的任务会同步计划日期和预计工时。",
-                            "muted", "wrap"), submit, manual);
+            hours.setOnAction(event -> {
+                if (manual.isVisible()) {
+                    confirm.fire();
+                } else {
+                    submit.fire();
+                }
+                event.consume();
+            });
+            if (entry != null) {
+                content.getChildren().setAll(field("已关联云效任务", label(target.get().label(), "section-title", "wrap")),
+                        field("实际工时（小时）", hours),
+                        label("同一工作项同一天再次提交会更新收工记的原登记。收工记创建的任务会同步计划日期和预计工时。",
+                                "muted", "wrap"), submit, manual);
+            } else {
+                VBox hoursField = field("小时数", hours);
+                hoursField.setPrefWidth(96);
+                submit.setMinWidth(Region.USE_PREF_SIZE);
+                submit.disableProperty().bind(target.isNull().or(hours.textProperty().isEmpty()));
+                HBox row = new HBox(8, hoursField, submit);
+                row.setAlignment(Pos.BOTTOM_LEFT);
+                if (picker != null) {
+                    VBox workItemField = field("云效工作项", picker);
+                    picker.setMinWidth(0);
+                    workItemField.setMinWidth(0);
+                    HBox.setHgrow(workItemField, Priority.ALWAYS);
+                    row.getChildren().addFirst(workItemField);
+                    picker.valueProperty().addListener((property, previous, selected) -> {
+                        if (selected != null) {
+                            recentEffortWorkItems.put(connection.scope(), selected.id());
+                            Platform.runLater(hours::requestFocus);
+                        }
+                    });
+                }
+                target.addListener((property, previous, selected) -> {
+                    resetRetry();
+                    status.setText("");
+                    manual.setVisible(false);
+                });
+                content.getChildren().setAll(row,
+                        label("同一工作项同一天再次登记会更新收工记的原登记。", "muted", "wrap"), manual);
+            }
             return hours;
         }
 
@@ -1310,13 +1563,18 @@ final class YunxiaoDialogs {
             }
 
             void load(int page, Fetch<T> fetch) {
+                load(page, fetch, ignored -> {});
+            }
+
+            void load(int page, Fetch<T> fetch, Consumer<Page<T>> onLoaded) {
                 run("正在读取云效列表…", () -> fetch.get(page), result -> {
                     combo.getItems().addAll(result.items());
                     more.setVisible(result.next() > 0);
-                    more.setOnAction(event -> load(result.next(), fetch));
+                    more.setOnAction(event -> load(result.next(), fetch, onLoaded));
                     if (combo.getItems().isEmpty() && result.next() == 0) {
                         status.setText("没有找到可访问的记录。");
                     }
+                    onLoaded.accept(result);
                 });
             }
         }
@@ -1346,6 +1604,16 @@ final class YunxiaoDialogs {
     private record CreationOptions(List<Choice> types, List<Choice> members) {}
 
     private record ParentSelection(Choice project, Item item, List<Choice> types) {}
+
+    private record RequirementCreation(long taskId, Choice project, Consumer<Item> onCreated) {}
+
+    private record EffortTarget(String itemId, String label, LocalDate day, SaveEffort save) {}
+
+    @FunctionalInterface
+    private interface SaveEffort {
+        void run(BigDecimal hours, boolean retryConfirmed, boolean verify)
+                throws SQLException, IOException, InterruptedException;
+    }
 
     @FunctionalInterface
     private interface Fetch<T> {
