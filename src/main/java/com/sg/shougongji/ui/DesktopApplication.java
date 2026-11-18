@@ -6,6 +6,7 @@ import com.sg.shougongji.model.WorkSession;
 import com.sg.shougongji.model.WorkTask;
 import com.sg.shougongji.model.Yunxiao.Binding;
 import com.sg.shougongji.model.Yunxiao.PendingEffort;
+import com.sg.shougongji.service.QuickEffortService;
 import com.sg.shougongji.service.ReviewService;
 import com.sg.shougongji.service.TimerService;
 import com.sg.shougongji.service.YunxiaoAutoSync;
@@ -115,6 +116,7 @@ public final class DesktopApplication extends Application {
     private FileChannel lockChannel;
     private FileLock lock;
     private TimerService timer;
+    private QuickEffortService quickEffort;
     private ReviewService reviewService;
     private WorkSession active;
     private LocalDate timerDate;
@@ -150,6 +152,7 @@ public final class DesktopApplication extends Application {
             }
             AppServices services = AppServices.open(dataDirectory.resolve("worklog.sqlite"), clock);
             timer = services.timer();
+            quickEffort = services.quickEffort();
             reviewService = services.review();
             yunxiaoSettings = services.yunxiaoSettings();
             autoSync = services.yunxiaoAutoSync();
@@ -198,10 +201,7 @@ public final class DesktopApplication extends Application {
         tick.play();
         Platform.runLater(() -> {
             if (active == null || recover()) {
-                perform(stage, () -> {
-                    requestAutoSync();
-                    yunxiao.offerDefaultAssignee(stage);
-                });
+                perform(stage, this::requestAutoSync);
             }
         });
     }
@@ -367,7 +367,17 @@ public final class DesktopApplication extends Application {
     }
 
     private VBox timerContent() {
-        VBox root = new VBox(17, createTimerHeader(), createTimerReadout(), createTimerControls(), createRecentSection());
+        Button register = button("快速登记工时", "primary");
+        register.setMaxWidth(Double.MAX_VALUE);
+        register.setOnAction(event -> perform(timerStage, () -> {
+            YunxiaoService connection = yunxiao.connection(timerStage);
+            if (connection != null) {
+                new QuickEffortDialog(timerStage, LocalDate.now(clock), quickEffort, connection, yunxiao,
+                        () -> perform(timerStage, this::refresh)).show();
+            }
+        }));
+        VBox header = new VBox(9, createTimerHeader(), register);
+        VBox root = new VBox(17, header, createTimerReadout(), createTimerControls(), createRecentSection());
         root.setAlignment(Pos.TOP_CENTER);
         root.getStyleClass().add("timer-page");
         return root;

@@ -148,31 +148,38 @@ public final class TimerService {
         });
     }
 
-    public void addWorkHours(LocalDate day, Long existingTask, String title, long seconds, String note, boolean estimated)
+    /** 返回此次保存是否产生了待同步的云效工时。 */
+    public boolean addWorkHours(LocalDate day, Long existingTask, String title, long seconds, String note, boolean estimated)
             throws SQLException {
-        saveWorkHours(day, null, existingTask, title, seconds, note, estimated);
+        return saveWorkHours(day, null, existingTask, title, seconds, note, estimated);
     }
 
-    public void editWorkHours(LocalDate day, DayReview.Entry entry, long seconds, String note, boolean estimated)
+    /** 返回此次保存是否产生了待同步的云效工时。 */
+    public boolean editWorkHours(LocalDate day, DayReview.Entry entry, long seconds, String note, boolean estimated)
             throws SQLException {
-        saveWorkHours(day, entry, entry.task().id(), entry.task().title(), seconds, note, estimated);
+        return saveWorkHours(day, entry, entry.task().id(), entry.task().title(), seconds, note, estimated);
     }
 
-    private void saveWorkHours(LocalDate day, DayReview.Entry original, Long existingTask, String title,
+    private boolean saveWorkHours(LocalDate day, DayReview.Entry original, Long existingTask, String title,
                                long seconds, String note, boolean estimated) throws SQLException {
-        if (seconds <= 0 || seconds > 25 * 3600) {
+        boolean sameDuration = original != null && seconds == original.seconds();
+        if (seconds <= 0 || (!sameDuration && seconds > 25 * 3600)) {
             throw new IllegalArgumentException("请输入有效工时，例如 3 或 1.5 小时。");
         }
         long dayStart = day.atStartOfDay(clock.getZone()).toEpochSecond();
         long dayEnd = day.plusDays(1).atStartOfDay(clock.getZone()).toEpochSecond();
         String dayKey = day.toString();
-        repository.inTransaction(mapper -> {
+        return repository.inTransactionReturning(mapper -> {
             long taskId = existingTask == null ? findOrCreateTaskId(mapper, title) : requireTask(mapper, existingTask);
             List<WorkSession> completed = mapper.findCompletedSessions(dayStart, dayEnd);
             if (original != null) {
                 List<WorkSession> current = completed.stream().filter(session -> session.task().id() == taskId).toList();
-                if (!current.equals(original.segments().stream().map(DayReview.Segment::session).toList())) {
+                if (!DayReview.summarize(day, dayStart, dayEnd, current).segments().equals(original.segments())) {
                     throw new IllegalArgumentException("该事项当天的记录已变更，请刷新后重试。");
+                }
+                if (sameDuration) {
+                    updateDayDetails(mapper, original, note.strip(), estimated);
+                    return false;
                 }
             }
 
@@ -216,7 +223,8 @@ public final class TimerService {
             if (original != null) {
                 for (WorkSession session : fixed) {
                     if (session.task().id() == taskId) {
-                        keepOutsideDay(mapper, session, dayStart, dayEnd);
+                        mapper.deleteSession(session.id());
+                        insertOutsideDay(mapper, session, dayStart, dayEnd);
                     }
                 }
             }
@@ -224,6 +232,7 @@ public final class TimerService {
             if (original == null) {
                 mapper.showInRecent(taskId);
             }
+            return enqueueEffort(mapper, taskId, dayStart, dayEnd);
         });
     }
 
@@ -251,8 +260,24 @@ public final class TimerService {
         }
     }
 
-    private static void keepOutsideDay(TimerMapper mapper, WorkSession session, long dayStart, long dayEnd) {
-        mapper.deleteSession(session.id());
+    private static void updateDayDetails(TimerMapper mapper, DayReview.Entry original, String note, boolean estimated) {
+        boolean noteChanged = !note.equals(String.join("\n", original.notes()).strip());
+        boolean estimateChanged = estimated != (original.estimatedSeconds() > 0);
+        for (DayReview.Segment segment : original.segments()) {
+            WorkSession session = segment.session();
+            String newNote = noteChanged ? note : session.note();
+            boolean newEstimate = estimateChanged ? estimated : session.estimated();
+            if (newNote.equals(session.note()) && newEstimate == session.estimated()) {
+                continue;
+            }
+            // 跨日记录只更新当前日期的部分，其他日期沿用原备注和估算标记。
+            insertOutsideDay(mapper, session, segment.start(), segment.end());
+            mapper.updateCompletedSession(session.id(), session.task().id(), segment.start(), segment.end(),
+                    newNote, newEstimate);
+        }
+    }
+
+    private static void insertOutsideDay(TimerMapper mapper, WorkSession session, long dayStart, long dayEnd) {
         long taskId = session.task().id();
         if (session.start() < dayStart) {
             mapper.insertCompletedSession(taskId, session.start(), dayStart, session.note(), session.estimated(), session.manual());
@@ -298,15 +323,16 @@ public final class TimerService {
         }
     }
 
-    private void enqueueEffort(TimerMapper mapper, long taskId, long startedAt, long endedAt) {
+    private boolean enqueueEffort(TimerMapper mapper, long taskId, long startedAt, long endedAt) {
         if (!mapper.automaticallyRegistersEffort(taskId)) {
-            return;
+            return false;
         }
         LocalDate firstDay = Instant.ofEpochSecond(startedAt).atZone(clock.getZone()).toLocalDate();
         LocalDate lastDay = Instant.ofEpochSecond(endedAt - 1).atZone(clock.getZone()).toLocalDate();
         for (LocalDate day = firstDay; !day.isAfter(lastDay); day = day.plusDays(1)) {
             mapper.enqueueEffort(taskId, day.toString());
         }
+        return true;
     }
 
     private static void ensureNoOverlap(TimerMapper mapper, long sessionIdToIgnore, long startedAt, long endedAt,

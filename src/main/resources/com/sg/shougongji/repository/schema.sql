@@ -19,6 +19,8 @@ ON work_session ((1)) WHERE ended_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS session_time ON work_session (started_at);
 
+CREATE INDEX IF NOT EXISTS session_task_time ON work_session (task_id, started_at);
+
 CREATE TABLE IF NOT EXISTS work_schedule (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     morning_start INTEGER NOT NULL,
@@ -77,6 +79,23 @@ CREATE TABLE IF NOT EXISTS yunxiao_assignee_preference (
     scope TEXT PRIMARY KEY,
     member_id TEXT NOT NULL,
     name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS yunxiao_quick_effort_draft (
+    scope TEXT NOT NULL,
+    day TEXT NOT NULL,
+    rows_json TEXT NOT NULL,
+    PRIMARY KEY (scope, day)
+);
+
+CREATE TABLE IF NOT EXISTS yunxiao_quick_effort_receipt (
+    scope TEXT NOT NULL,
+    child_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    note TEXT NOT NULL,
+    hours TEXT,
+    timed_seconds INTEGER NOT NULL,
+    PRIMARY KEY (scope, child_id, day)
 );
 
 CREATE TABLE IF NOT EXISTS yunxiao_write (

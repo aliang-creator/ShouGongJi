@@ -7,6 +7,7 @@ import com.sg.shougongji.model.Yunxiao.ChildDraft;
 import com.sg.shougongji.model.Yunxiao.ConnectionSettings;
 import com.sg.shougongji.model.Yunxiao.PendingEffort;
 import com.sg.shougongji.model.Yunxiao.PendingWrite;
+import com.sg.shougongji.model.Yunxiao.QuickEffortReceipt;
 
 import java.sql.SQLException;
 import java.util.HashMap;
@@ -67,6 +68,26 @@ public final class YunxiaoRepository {
         return database.read(YunxiaoMapper.class, mapper -> mapper.findTaskForEffort(binding, operation));
     }
 
+    public List<Binding> findQuickEffortBindings(String scope) throws SQLException {
+        return database.read(YunxiaoMapper.class, mapper -> mapper.findQuickEffortBindings(scope));
+    }
+
+    public List<Binding> findRegisteredBindings(String scope, String day) throws SQLException {
+        return database.read(YunxiaoMapper.class, mapper -> mapper.findRegisteredBindings(scope, day));
+    }
+
+    public String findQuickEffortDraft(String scope, String day) throws SQLException {
+        return database.read(YunxiaoMapper.class, mapper -> mapper.findQuickEffortDraft(scope, day));
+    }
+
+    public void saveQuickEffortDraft(String scope, String day, String rows) throws SQLException {
+        database.write(YunxiaoMapper.class, mapper -> mapper.saveQuickEffortDraft(scope, day, rows));
+    }
+
+    public QuickEffortReceipt findQuickEffortReceipt(Binding binding, String day) throws SQLException {
+        return database.read(YunxiaoMapper.class, mapper -> mapper.findQuickEffortReceipt(binding, day));
+    }
+
     public void bind(long taskId, Binding binding) throws SQLException {
         database.write(YunxiaoMapper.class, mapper -> {
             if (mapper.saveBinding(taskId, binding) != 1) {
@@ -120,6 +141,10 @@ public final class YunxiaoRepository {
         return database.read(YunxiaoMapper.class, mapper -> mapper.findPendingEffort(taskId, day));
     }
 
+    public List<PendingEffort> findLinkedPendingEfforts(Binding binding, String day) throws SQLException {
+        return database.read(YunxiaoMapper.class, mapper -> mapper.findLinkedPendingEfforts(binding, day));
+    }
+
     public int pendingEffortCount() throws SQLException {
         return database.read(YunxiaoMapper.class, YunxiaoMapper::pendingEffortCount);
     }
@@ -132,8 +157,27 @@ public final class YunxiaoRepository {
         database.write(YunxiaoMapper.class, mapper -> mapper.completePendingEffort(effort));
     }
 
+    public void completeQuickEffort(Binding binding, String day, QuickEffortReceipt receipt, List<PendingEffort> efforts)
+            throws SQLException {
+        database.write(YunxiaoMapper.class, mapper -> {
+            mapper.saveQuickEffortReceipt(binding, day, receipt);
+            efforts.forEach(mapper::completePendingEffort);
+        });
+    }
+
+    public void completeManualEffort(Binding binding, String day, List<PendingEffort> efforts) throws SQLException {
+        database.write(YunxiaoMapper.class, mapper -> {
+            mapper.clearQuickEffortBaseline(binding, day);
+            efforts.forEach(mapper::completePendingEffort);
+        });
+    }
+
     public boolean hasCreatedTask(long taskId, Binding binding) throws SQLException {
         return database.read(YunxiaoMapper.class, mapper -> mapper.hasCreatedTask(taskId, binding));
+    }
+
+    public PendingWrite findWrite(long taskId, String scope, String operation) throws SQLException {
+        return database.read(YunxiaoMapper.class, mapper -> mapper.findWrite(taskId, scope, operation));
     }
 
     public PendingWrite reserveWrite(long taskId, String scope, String operation) throws SQLException {

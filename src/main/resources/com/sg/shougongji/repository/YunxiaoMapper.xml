@@ -49,6 +49,14 @@
         </constructor>
     </resultMap>
 
+    <resultMap id="quickEffortReceipt" type="com.sg.shougongji.model.Yunxiao$QuickEffortReceipt">
+        <constructor>
+            <arg column="note" javaType="string"/>
+            <arg column="hours" javaType="java.math.BigDecimal"/>
+            <arg column="timed_seconds" javaType="_long"/>
+        </constructor>
+    </resultMap>
+
     <select id="findConnection" resultMap="connection">
         SELECT instance, organization_id, access_token FROM yunxiao_connection WHERE id = 1
     </select>
@@ -99,10 +107,60 @@
         ORDER BY EXISTS (
             SELECT 1 FROM yunxiao_write write_state
             WHERE write_state.task_id = binding.task_id AND write_state.scope = binding.scope
+              AND write_state.operation = #{operation} AND write_state.remote_id &lt;&gt; ''
+        ) DESC, EXISTS (
+            SELECT 1 FROM yunxiao_write write_state
+            WHERE write_state.task_id = binding.task_id AND write_state.scope = binding.scope
               AND write_state.operation = #{operation}
         ) DESC, binding.task_id
         LIMIT 1
     </select>
+
+    <select id="findQuickEffortBindings" resultMap="binding">
+        SELECT b.scope, b.child_id, b.label FROM yunxiao_binding b
+        WHERE b.scope = #{scope}
+        ORDER BY MAX(
+            COALESCE((SELECT MAX(SUBSTR(w.operation, -10)) FROM yunxiao_write w
+                WHERE w.task_id = b.task_id AND w.scope = b.scope AND w.remote_id &lt;&gt; ''
+                  AND w.operation GLOB ('effort:' || b.child_id || ':????-??-??')), ''),
+            COALESCE((SELECT DATE(MAX(s.started_at), 'unixepoch') FROM work_session s
+                WHERE s.task_id = b.task_id), '')
+        ) DESC, b.task_id DESC
+    </select>
+
+    <select id="findRegisteredBindings" resultMap="binding">
+        SELECT b.scope, b.child_id, b.label FROM yunxiao_binding b
+        JOIN yunxiao_write w ON w.task_id = b.task_id AND w.scope = b.scope
+        WHERE b.scope = #{scope} AND w.operation = 'effort:' || b.child_id || ':' || #{day}
+          AND w.remote_id &lt;&gt; ''
+        ORDER BY b.task_id
+    </select>
+
+    <select id="findQuickEffortDraft" resultType="string">
+        SELECT rows_json FROM yunxiao_quick_effort_draft WHERE scope = #{scope} AND day = #{day}
+    </select>
+
+    <insert id="saveQuickEffortDraft">
+        INSERT INTO yunxiao_quick_effort_draft (scope, day, rows_json) VALUES (#{scope}, #{day}, #{rows})
+        ON CONFLICT (scope, day) DO UPDATE SET rows_json = excluded.rows_json
+    </insert>
+
+    <select id="findQuickEffortReceipt" resultMap="quickEffortReceipt">
+        SELECT note, hours, timed_seconds FROM yunxiao_quick_effort_receipt
+        WHERE scope = #{binding.scope} AND child_id = #{binding.childId} AND day = #{day}
+    </select>
+
+    <insert id="saveQuickEffortReceipt">
+        INSERT INTO yunxiao_quick_effort_receipt (scope, child_id, day, note, hours, timed_seconds)
+        VALUES (#{binding.scope}, #{binding.childId}, #{day}, #{receipt.note}, #{receipt.hours}, #{receipt.timedSeconds})
+        ON CONFLICT (scope, child_id, day) DO UPDATE SET note = excluded.note,
+            hours = excluded.hours, timed_seconds = excluded.timed_seconds
+    </insert>
+
+    <update id="clearQuickEffortBaseline">
+        UPDATE yunxiao_quick_effort_receipt SET hours = NULL
+        WHERE scope = #{binding.scope} AND child_id = #{binding.childId} AND day = #{day}
+    </update>
 
     <select id="findChildTimerTask" resultType="long">
         SELECT task_id FROM yunxiao_timer_task
@@ -147,6 +205,12 @@
         WHERE e.task_id = #{taskId} AND e.day = #{day}
     </select>
 
+    <select id="findLinkedPendingEfforts" resultMap="pendingEffort">
+        <include refid="pendingEffortWithTask"/>
+        JOIN yunxiao_binding b ON b.task_id = t.task_id AND b.scope = t.scope
+        WHERE b.scope = #{binding.scope} AND b.child_id = #{binding.childId} AND e.day = #{day}
+    </select>
+
     <select id="pendingEffortCount" resultType="int">
         SELECT COUNT(*) FROM yunxiao_auto_effort
     </select>
@@ -173,6 +237,11 @@
             WHERE task_id = #{taskId} AND scope = #{binding.scope} AND remote_id = #{binding.childId}
               AND (operation LIKE 'project-task:%' OR operation LIKE 'child:%')
         )
+    </select>
+
+    <select id="findWrite" resultMap="pendingWrite">
+        SELECT marker, remote_id, 0 AS fresh FROM yunxiao_write
+        WHERE task_id = #{taskId} AND scope = #{scope} AND operation = #{operation}
     </select>
 
     <select id="reserveWrite" resultMap="pendingWrite" affectData="true" flushCache="true">

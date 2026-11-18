@@ -5,7 +5,6 @@ import com.sg.shougongji.repository.YunxiaoRepository;
 
 import java.io.IOException;
 import java.sql.SQLException;
-import java.time.LocalDate;
 
 public final class YunxiaoAutoSync {
     private final YunxiaoRepository repository;
@@ -29,11 +28,7 @@ public final class YunxiaoAutoSync {
         Failure firstFailure = null;
         for (PendingEffort pending : repository.pendingEfforts(connection.scope())) {
             try {
-                long seconds = review.loadDay(LocalDate.parse(pending.day())).entries().stream()
-                        .filter(entry -> entry.task().id() == pending.taskId())
-                        .mapToLong(entry -> entry.seconds())
-                        .sum();
-                connection.syncTimedEffort(pending, seconds, pending.equals(confirmedRetry));
+                connection.syncTimedEffort(pending, review, pending.equals(confirmedRetry));
             } catch (IOException | SQLException | IllegalArgumentException failure) {
                 if (firstFailure == null) {
                     firstFailure = new Failure(pending, failure);

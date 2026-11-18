@@ -13,6 +13,7 @@ import com.sg.shougongji.model.Yunxiao.PendingEffort;
 import com.sg.shougongji.model.Yunxiao.PendingWrite;
 import com.sg.shougongji.model.Yunxiao.Planning;
 import com.sg.shougongji.model.Yunxiao.ProtocolException;
+import com.sg.shougongji.model.Yunxiao.QuickEffortReceipt;
 import com.sg.shougongji.model.Yunxiao.WorkItemKind;
 import com.sg.shougongji.model.Yunxiao.WorkItemStatus;
 import com.sg.shougongji.model.YunxiaoWeek;
@@ -51,9 +52,9 @@ public final class YunxiaoService {
     public static final class ManualEffortRequired extends IOException {
         private final String newRecordDescription;
 
-        ManualEffortRequired(PendingWrite write, ApiException cause) {
+        ManualEffortRequired(PendingWrite write, ApiException cause, String note) {
             super("云效开放接口拒绝了休息日工时，请在网页勾选「包含休息日」。", cause);
-            newRecordDescription = write.remoteId().isBlank() ? effortDescription(write.marker()) : "";
+            newRecordDescription = write.remoteId().isBlank() ? effortDescription(write.marker(), note) : "";
         }
 
         public String newRecordDescription() {
@@ -246,23 +247,28 @@ public final class YunxiaoService {
         return bind(taskId, draft.project(), draft.parent(), item);
     }
 
-    synchronized void syncTimedEffort(PendingEffort pending, long seconds, boolean retryConfirmed)
+    synchronized void syncTimedEffort(PendingEffort pending, ReviewService review, boolean retryConfirmed)
             throws SQLException, IOException, InterruptedException {
         if (!pending.equals(repository.pendingEffort(pending.taskId(), pending.day()))) {
             return;
         }
-        if (seconds > 0) {
-            long taskId = pending.taskId();
-            Binding binding = repository.findBinding(taskId);
+        long taskId = pending.taskId();
+        LocalDate day = LocalDate.parse(pending.day());
+        Binding binding = repository.findBinding(taskId);
+        long seconds = review.linkedSeconds(day, taskId, binding);
+        QuickEffortReceipt receipt = binding == null ? null : repository.findQuickEffortReceipt(binding, pending.day());
+        if (seconds > 0 || receipt != null && receipt.hours() != null) {
             if (binding == null) {
                 ChildDraft draft = automaticChildDraft(taskId);
                 binding = create(taskId, draft.project(), draft.parent(), draft.typeId(), draft.title(),
                         draft.assignee(), draft.description(), draft.fields(), retryConfirmed);
+                receipt = repository.findQuickEffortReceipt(binding, pending.day());
             }
             BigDecimal hours = effortHours(seconds);
-            if (hours.signum() > 0) {
-                submitActualEffort(taskId, binding, LocalDate.parse(pending.day()), hours, retryConfirmed);
+            if (receipt != null && receipt.hours() != null) {
+                hours = receipt.hours().add(effortHours(seconds - receipt.timedSeconds())).max(BigDecimal.ZERO);
             }
+            submitActualEffort(effortTask(binding, day), binding, day, hours, noteFrom(receipt), retryConfirmed);
         }
         repository.completePendingEffort(pending);
     }
@@ -388,22 +394,16 @@ public final class YunxiaoService {
     public synchronized void submit(long taskId, Binding binding, LocalDate day, BigDecimal hours,
                                     boolean retryConfirmed)
             throws SQLException, IOException, InterruptedException {
-        PendingEffort pending = repository.pendingEffort(taskId, day.toString());
-        submitActualEffort(taskId, binding, day, hours, retryConfirmed);
-        if (pending != null) {
-            repository.completePendingEffort(pending);
-        }
+        List<PendingEffort> pending = repository.findLinkedPendingEfforts(binding, day.toString());
+        submitActualEffort(effortTask(binding, day), binding, day, hours, savedNote(binding, day), retryConfirmed);
+        repository.completeManualEffort(binding, day.toString(), pending);
         syncPlanAndEstimate(taskId, binding, day, hours, retryConfirmed);
     }
 
     public synchronized void registerLinkedEffort(Binding binding, LocalDate day, BigDecimal hours,
                                                    boolean retryConfirmed, boolean verify)
             throws SQLException, IOException, InterruptedException {
-        checkScope(binding);
-        Long taskId = repository.findTaskForEffort(binding, actualEffortOperation(binding.childId(), day));
-        if (taskId == null) {
-            throw new IllegalArgumentException("该工作项已解除关联，请刷新云效周工时后重试。");
-        }
+        long taskId = effortTask(binding, day);
         if (verify) {
             confirmWebEffort(taskId, binding, day, hours, retryConfirmed);
         } else {
@@ -422,23 +422,62 @@ public final class YunxiaoService {
         registerLinkedEffort(binding, day, hours, retryConfirmed, verify);
     }
 
+    synchronized void registerQuickEffort(Binding binding, LocalDate day, BigDecimal hours, String note, ReviewService review,
+                                          boolean retryConfirmed, boolean verify)
+            throws SQLException, IOException, InterruptedException {
+        long taskId = effortTask(binding, day);
+        List<PendingEffort> pending = repository.findLinkedPendingEfforts(binding, day.toString());
+        long timedSeconds = review.linkedSeconds(day, taskId, binding);
+        String description = note.strip();
+        if (verify) {
+            verifyActualEffort(taskId, binding, day, hours);
+        } else {
+            submitActualEffort(taskId, binding, day, hours, description, retryConfirmed);
+        }
+        // 只清理这次提交前已有的版本。上传期间新结束的计时仍留在队列中。
+        repository.completeQuickEffort(binding, day.toString(), new QuickEffortReceipt(description, hours, timedSeconds), pending);
+    }
+
+    private String savedNote(Binding binding, LocalDate day) throws SQLException {
+        return noteFrom(repository.findQuickEffortReceipt(binding, day.toString()));
+    }
+
+    private static String noteFrom(QuickEffortReceipt receipt) {
+        return receipt == null ? "" : receipt.note();
+    }
+
+    private long effortTask(Binding binding, LocalDate day) throws SQLException {
+        checkScope(binding);
+        Long taskId = repository.findTaskForEffort(binding, actualEffortOperation(binding.childId(), day));
+        if (taskId == null) {
+            throw new IllegalArgumentException("该工作项已解除关联，请重新选择。");
+        }
+        return taskId;
+    }
+
     private void submitActualEffort(long taskId, Binding binding, LocalDate day, BigDecimal hours,
-                                    boolean retryConfirmed)
+                                    String note, boolean retryConfirmed)
             throws SQLException, IOException, InterruptedException {
         checkScope(binding);
         String workItemId = binding.childId();
         String operation = actualEffortOperation(workItemId, day);
-        PendingWrite pendingWrite = repository.reserveWrite(taskId, client.scope(), operation);
+        // 极短的工时可能舍入为零。只更正之前的登记，首次登记时不创建零工时。
+        boolean createIfMissing = hours.signum() > 0;
+        PendingWrite pendingWrite = createIfMissing ? repository.reserveWrite(taskId, client.scope(), operation)
+                : repository.findWrite(taskId, client.scope(), operation);
+        if (pendingWrite == null) {
+            return;
+        }
         try {
-            saveEffort(pendingWrite, retryConfirmed, () -> client.efforts(workItemId),
-                    (recordId, marker) -> client.saveEffort(workItemId, recordId, day, hours, effortDescription(marker)));
+            saveEffort(pendingWrite, retryConfirmed, createIfMissing, () -> client.efforts(workItemId),
+                    (recordId, marker) -> client.saveEffort(workItemId, recordId, day, hours, effortDescription(marker, note)));
         } catch (ApiException failure) {
             if (!failure.restDayRejected()) {
                 throw failure;
             }
             PendingWrite currentWrite = repository.reserveWrite(taskId, client.scope(), operation);
             if (!confirmActualEffort(workItemId, currentWrite, day, hours)) {
-                throw new ManualEffortRequired(currentWrite, failure);
+                throw new ManualEffortRequired(currentWrite, failure, note);
             }
         }
     }
@@ -446,18 +485,20 @@ public final class YunxiaoService {
     public synchronized void confirmWebEffort(long taskId, Binding binding, LocalDate day, BigDecimal hours,
                                               boolean retryConfirmed)
             throws SQLException, IOException, InterruptedException {
-        checkScope(binding);
-        PendingEffort pending = repository.pendingEffort(taskId, day.toString());
+        List<PendingEffort> pending = repository.findLinkedPendingEfforts(binding, day.toString());
+        verifyActualEffort(effortTask(binding, day), binding, day, hours);
+        repository.completeManualEffort(binding, day.toString(), pending);
+        syncPlanAndEstimate(taskId, binding, day, hours, retryConfirmed);
+    }
+
+    private void verifyActualEffort(long taskId, Binding binding, LocalDate day, BigDecimal hours)
+            throws SQLException, IOException, InterruptedException {
         String workItemId = binding.childId();
         String operation = actualEffortOperation(workItemId, day);
         PendingWrite pendingWrite = repository.reserveWrite(taskId, client.scope(), operation);
         if (!confirmActualEffort(workItemId, pendingWrite, day, hours)) {
             throw new IllegalArgumentException("还未核对到这笔登记，请检查云效中的日期、小时数和登记说明。");
         }
-        if (pending != null) {
-            repository.completePendingEffort(pending);
-        }
-        syncPlanAndEstimate(taskId, binding, day, hours, retryConfirmed);
     }
 
     private void checkScope(Binding binding) {
@@ -501,7 +542,7 @@ public final class YunxiaoService {
             String owner = fillMissingPlanDates(workItemId, day);
             String operation = "estimate:" + workItemId + ":" + day;
             PendingWrite pendingWrite = repository.reserveWrite(taskId, client.scope(), operation);
-            saveEffort(pendingWrite, retryConfirmed, () -> client.estimatedEfforts(workItemId),
+            saveEffort(pendingWrite, retryConfirmed, true, () -> client.estimatedEfforts(workItemId),
                     (recordId, marker) -> client.saveEstimatedEffort(workItemId, recordId, owner, hours,
                             day + " 由收工记登记\n" + marker));
         } catch (IOException | SQLException | InterruptedException | IllegalArgumentException | ProtocolException failure) {
@@ -531,11 +572,11 @@ public final class YunxiaoService {
                 ? existing.substring(0, 10) : fallback.toString();
     }
 
-    private static String effortDescription(String marker) {
-        return "由收工记登记\n" + marker;
+    private static String effortDescription(String marker, String note) {
+        return note.isBlank() ? "由收工记登记\n" + marker : note + "\n" + marker;
     }
 
-    private void saveEffort(PendingWrite pendingWrite, boolean retryConfirmed, EffortLookup lookup,
+    private void saveEffort(PendingWrite pendingWrite, boolean retryConfirmed, boolean createIfMissing, EffortLookup lookup,
                             EffortSave save)
             throws SQLException, IOException, InterruptedException {
         String marker = pendingWrite.marker();
@@ -548,7 +589,11 @@ public final class YunxiaoService {
             recordId = resolveExistingRecordId(matches, retryConfirmed);
         }
         if (recordId.isBlank()) {
-            createRemoteRecord(pendingWrite, () -> save.run("", marker));
+            if (createIfMissing) {
+                createRemoteRecord(pendingWrite, () -> save.run("", marker));
+            } else {
+                repository.releaseWrite(marker);
+            }
             return;
         }
         if (pendingWrite.remoteId().isBlank()) {

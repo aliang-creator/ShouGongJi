@@ -120,7 +120,7 @@ public final class WorkLogDatabase {
     }
 
     @FunctionalInterface
-    interface MapperQuery<M, R> {
+    public interface MapperQuery<M, R> {
         R run(M mapper) throws SQLException;
     }
 

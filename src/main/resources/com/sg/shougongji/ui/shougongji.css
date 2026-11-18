@@ -478,6 +478,19 @@
 .dialog-pane:header .header-panel .label { -fx-font-size: 18px; -fx-font-weight: bold; }
 .dialog-pane > .content, .dialog-pane > .content.label { -fx-padding: 16 22; }
 .dialog-pane > .button-bar > .container { -fx-padding: 0 22 17; }
+.quick-effort-row {
+    -fx-padding: 9 11;
+    -fx-background-color: #ffffffbd;
+    -fx-background-radius: 9;
+    -fx-border-color: -sg-line;
+    -fx-border-radius: 9;
+}
+.quick-effort-duration { -fx-min-width: 86; -fx-max-width: 106; }
+.quick-effort-note { -fx-min-width: 100; -fx-max-width: 140; }
+.quick-effort-empty { -fx-padding: 16 10; }
+.quick-effort-footer { -fx-padding: 8 2 0; -fx-border-color: -sg-line; -fx-border-width: 1 0 0; }
+.quick-effort-total { -fx-font-size: 19px; -fx-font-weight: bold; }
+.quick-effort-saved { -fx-text-fill: #256748; }
 .yunxiao-week .week-overview {
     -fx-padding: 11 15;
     -fx-background-color: linear-gradient(to right, #e8f1ff, #fbfcff);

@@ -82,6 +82,77 @@ class TimerServiceTest {
     }
 
     @Test
+    void savingDayDetailsKeepsMeasuredAndScheduledSegmentsInPlace() throws Exception {
+        at("14:00");
+        services.timer().start("排查");
+        at("14:42");
+        pause();
+        long taskId = services.timer().recentTasks().getFirst().id();
+        assertFalse(services.timer().addWorkHours(DAY, taskId, "排查", 1200, "整理日志", true));
+        services.timer().addWorkHours(DAY, taskId, "排查", 600, "补测", false);
+        DayReview before = services.review().loadDay(DAY);
+        DayReview.Entry entry = before.entries().getFirst();
+        String initialNote = String.join("\n", entry.notes());
+
+        services.timer().editWorkHours(DAY, entry, entry.seconds(), initialNote, true);
+        assertEquals(before, services.review().loadDay(DAY));
+
+        services.timer().editWorkHours(DAY, entry, entry.seconds(), "已确认原因", true);
+        DayReview edited = services.review().loadDay(DAY);
+        assertEquals(ranges(before), ranges(edited));
+        assertEquals(1200, edited.estimatedSeconds());
+        for (int i = 0; i < before.segments().size(); i++) {
+            WorkSession original = before.segments().get(i).session();
+            WorkSession updated = edited.segments().get(i).session();
+            assertEquals(original.id(), updated.id());
+            assertEquals(original.manual(), updated.manual());
+            assertEquals(original.estimated(), updated.estimated());
+            assertEquals("已确认原因", updated.note());
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> services.timer().editWorkHours(DAY, entry, entry.seconds(), initialNote, true));
+    }
+
+    @Test
+    void changingEstimatesAlonePreservesIndividualNotes() throws Exception {
+        at("18:00");
+        services.timer().saveSession(null, "联调", local("13:00"), local("13:30"), "准备", true);
+        services.timer().saveSession(null, "联调", local("16:00"), local("17:00"), "验证", false);
+        DayReview before = services.review().loadDay(DAY);
+        DayReview.Entry entry = before.entries().getFirst();
+        services.timer().editWorkHours(DAY, entry, entry.seconds(), String.join("\n", entry.notes()), false);
+        DayReview edited = services.review().loadDay(DAY);
+        assertEquals(ranges(before), ranges(edited));
+        assertEquals(0, edited.estimatedSeconds());
+        assertEquals(List.of("准备", "验证"), edited.segments().stream().map(s -> s.session().note()).toList());
+    }
+
+    @Test
+    void editingCrossMidnightNotesChangesOnlyTheSelectedDay() throws Exception {
+        at("23:40");
+        services.timer().start("值班");
+        LocalDate tomorrow = DAY.plusDays(1);
+        clock.time = tomorrow.atTime(0, 20).atZone(ZONE).toInstant();
+        pause();
+        DayReview.Entry entry = services.review().loadDay(DAY).entries().getFirst();
+        DayReview nextDay = services.review().loadDay(tomorrow);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> services.timer().editWorkHours(tomorrow, entry, entry.seconds(), "当天值班", false));
+        services.timer().editWorkHours(DAY, entry, entry.seconds(), "", false);
+        assertEquals(nextDay, services.review().loadDay(tomorrow));
+        services.timer().editWorkHours(DAY, entry, entry.seconds(), "当天值班", false);
+        DayReview edited = services.review().loadDay(DAY);
+        assertEquals(List.of("23:40–00:00"), ranges(edited));
+        assertEquals("当天值班", edited.segments().getFirst().session().note());
+        assertFalse(edited.segments().getFirst().session().manual());
+        DayReview afterMidnight = services.review().loadDay(tomorrow);
+        assertEquals(List.of("00:00–00:20"), ranges(afterMidnight));
+        assertEquals("", afterMidnight.segments().getFirst().session().note());
+        assertFalse(afterMidnight.segments().getFirst().session().manual());
+    }
+
+    @Test
     void schedulesBySaveOrderSkipsLunchAndReflowsLaterWorkWhenHoursChange() throws Exception {
         at("20:00");
         WorkSchedule custom = new WorkSchedule(560, 740, 830, 1150);

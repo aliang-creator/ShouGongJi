@@ -63,6 +63,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -127,15 +128,6 @@ final class YunxiaoDialogs {
             settings.forgetConnection();
         } else if (choice == assigneeSettings) {
             new AssigneeSettings(owner, savedConnection, savedConnection.defaultAssignee()).show();
-        } else if (choice.getButtonData() == ButtonBar.ButtonData.OK_DONE) {
-            offerDefaultAssignee(owner);
-        }
-    }
-
-    void offerDefaultAssignee(Window owner) throws SQLException {
-        YunxiaoService connection = settings.currentConnection();
-        if (connection != null && connection.defaultAssignee() == null) {
-            new AssigneeSettings(owner, connection, null).show();
         }
     }
 
@@ -180,6 +172,17 @@ final class YunxiaoDialogs {
         new WorkDialog(owner, connection, null, day, null).showDirectEffort(onChanged);
     }
 
+    void chooseEffortTask(Window owner, YunxiaoService connection, BiConsumer<Choice, Item> onSelected) {
+        new WorkDialog(owner, connection, null, null, null).showEffortTaskPicker(onSelected);
+    }
+
+    void openWorkItem(YunxiaoService connection, String itemId) {
+        String url = connection.workItemPage(itemId);
+        if (!url.isBlank()) {
+            openPage.accept(url);
+        }
+    }
+
     WeekEffortForm weekEffortForm(YunxiaoService connection, LocalDate day, List<Binding> workItems,
                                   Consumer<String> onRecorded) {
         return new WorkDialog(connection, null, day, null).weekEffortForm(workItems, onRecorded);
@@ -216,7 +219,7 @@ final class YunxiaoDialogs {
         }
     }
 
-    private YunxiaoService connection(Window owner) throws SQLException {
+    YunxiaoService connection(Window owner) throws SQLException {
         YunxiaoService connection = settings.currentConnection();
         if (connection == null) {
             configure(owner);
@@ -592,27 +595,9 @@ final class YunxiaoDialogs {
             dialog.setHeaderText("补登云效工时");
             DatePicker date = new DatePicker(day);
             date.setEditable(false);
-            Picker<Choice> projects = new Picker<>();
-            projects.combo.setPromptText("选择云效项目");
-            Picker<Item> tasks = new Picker<>();
-            tasks.combo.setPromptText("选择任务或子任务");
-            TextField query = new TextField();
-            query.setPromptText("输入任务标题或完整编号");
-            HBox.setHgrow(query, Priority.ALWAYS);
-            Button search = button("搜索", "secondary");
-            search.disableProperty().bind(projects.combo.valueProperty().isNull());
-            query.disableProperty().bind(search.disableProperty());
-            Runnable findTask = () -> searchEffortTasks(projects.combo.getValue(), query.getText(), tasks, true);
-            search.setOnAction(event -> findTask.run());
-            query.setOnAction(event -> findTask.run());
-            projects.combo.valueProperty().addListener((observable, old, project) -> {
-                if (project != null) {
-                    recentEffortProjects.put(connection.scope(), project);
-                    searchEffortTasks(project, query.getText(), tasks, false);
-                } else {
-                    tasks.clear();
-                }
-            });
+            EffortTaskPicker picker = new EffortTaskPicker();
+            Picker<Choice> projects = picker.projects;
+            Picker<Item> tasks = picker.tasks;
             var target = Bindings.createObjectBinding(() -> {
                 Choice project = projects.combo.getValue();
                 Item item = tasks.combo.getValue();
@@ -629,23 +614,82 @@ final class YunxiaoDialogs {
                     Platform.runLater(hours::requestFocus);
                 }
             });
-            VBox projectField = field("项目", projects.row);
+            VBox projectField = picker.projectField();
             projectField.setMinWidth(0);
             HBox.setHgrow(projectField, Priority.ALWAYS);
             HBox context = new HBox(8, field("登记日期", date), projectField);
-            content.getChildren().addAll(0, List.of(context, new HBox(8, query, search), field("云效任务", tasks.row)));
+            content.getChildren().addAll(0, List.of(context, picker.searchRow, picker.taskField()));
             showWhenChanged(onChanged);
-            projects.load(1, connection::projects, loaded -> {
-                if (projects.combo.getValue() != null) {
-                    return;
-                }
-                Choice recent = recentEffortProjects.get(connection.scope());
-                if (projects.combo.getItems().contains(recent)) {
-                    projects.combo.setValue(recent);
-                } else if (loaded.next() == 0 && projects.combo.getItems().size() == 1) {
-                    projects.combo.getSelectionModel().selectFirst();
-                }
+            picker.loadProjects();
+        }
+
+        void showEffortTaskPicker(BiConsumer<Choice, Item> onSelected) {
+            dialog.setTitle("添加云效任务");
+            dialog.setHeaderText("添加云效任务");
+            EffortTaskPicker picker = new EffortTaskPicker();
+            Button add = button("添加到清单", "primary");
+            add.disableProperty().bind(picker.tasks.combo.valueProperty().isNull());
+            add.setOnAction(event -> {
+                Choice project = picker.projects.combo.getValue();
+                Item task = picker.tasks.combo.getValue();
+                recentEffortWorkItems.put(connection.scope(), task.id());
+                dialog.close();
+                onSelected.accept(project, task);
             });
+            content.getChildren().setAll(picker.projectField(), picker.searchRow, picker.taskField(), add);
+            dialog.show();
+            picker.loadProjects();
+        }
+
+        private final class EffortTaskPicker {
+            private final Picker<Choice> projects = new Picker<>();
+            private final Picker<Item> tasks = new Picker<>();
+            private final HBox searchRow;
+
+            EffortTaskPicker() {
+                projects.combo.setPromptText("选择云效项目");
+                tasks.combo.setPromptText("选择任务或子任务");
+                TextField query = new TextField();
+                query.setPromptText("输入任务标题或完整编号");
+                HBox.setHgrow(query, Priority.ALWAYS);
+                Button search = button("搜索", "secondary");
+                searchRow = new HBox(8, query, search);
+                search.disableProperty().bind(projects.combo.valueProperty().isNull());
+                query.disableProperty().bind(search.disableProperty());
+                Runnable findTask = () -> searchEffortTasks(projects.combo.getValue(), query.getText(), tasks, true);
+                search.setOnAction(event -> findTask.run());
+                query.setOnAction(event -> findTask.run());
+                projects.combo.valueProperty().addListener((observable, old, project) -> {
+                    if (project == null) {
+                        tasks.clear();
+                    } else {
+                        recentEffortProjects.put(connection.scope(), project);
+                        searchEffortTasks(project, query.getText(), tasks, false);
+                    }
+                });
+            }
+
+            VBox projectField() {
+                return field("项目", projects.row);
+            }
+
+            VBox taskField() {
+                return field("云效任务", tasks.row);
+            }
+
+            void loadProjects() {
+                projects.load(1, connection::projects, loaded -> {
+                    if (projects.combo.getValue() != null) {
+                        return;
+                    }
+                    Choice recent = recentEffortProjects.get(connection.scope());
+                    if (projects.combo.getItems().contains(recent)) {
+                        projects.combo.setValue(recent);
+                    } else if (loaded.next() == 0 && projects.combo.getItems().size() == 1) {
+                        projects.combo.getSelectionModel().selectFirst();
+                    }
+                });
+            }
         }
 
         private void searchEffortTasks(Choice project, String query, Picker<Item> tasks, boolean showResults) {

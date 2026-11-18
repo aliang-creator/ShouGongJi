@@ -18,6 +18,7 @@ import com.sg.shougongji.model.Yunxiao.WorkItemStatus;
 import com.sg.shougongji.model.YunxiaoWeek;
 import com.sg.shougongji.repository.WorkLogDatabase;
 import com.sg.shougongji.repository.YunxiaoRepository;
+import com.sg.shougongji.service.QuickEffortService.Row;
 import com.sg.shougongji.service.TimerService;
 import com.sg.shougongji.service.YunxiaoService;
 import org.junit.jupiter.api.Test;
@@ -179,6 +180,133 @@ class YunxiaoServiceTest {
         });
         sync.registerTaskEffort(project, task, day, BigDecimal.valueOf(2), false, false);
         assertEquals(1, repository.findBindings().size());
+        cloud.assertDone();
+    }
+
+    @Test
+    void quickEffortReusesYesterdayAndRetainsExactDraftsWithoutMixingOrganizations() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoRepository repository = open();
+        YunxiaoService connection = new YunxiaoService(repository, cloud.central());
+        Instant now = Instant.parse("2026-11-12T20:00:00Z");
+        LocalDate today = LocalDate.ofInstant(now, ZoneOffset.UTC);
+        LocalDate yesterday = today.minusDays(1);
+        AppServices services = servicesAt(now);
+        var quick = services.quickEffort();
+        Choice project = new Choice("project-1", "项目");
+        Binding standalone = quick.addTask(connection, project,
+                new Item("standalone", "", "例会", "", project.id(), "Task", "", ""));
+        cloud.answer("POST", "/workitems/standalone/effortRecords", "{\"id\":\"yesterday-meeting\"}");
+        connection.registerLinkedEffort(standalone, yesterday, BigDecimal.ONE, false, false);
+
+        var timer = services.timer();
+        Binding timed = new Binding(connection.scope(), "timed", "项目 / 联调");
+        for (int index = 1; index <= 3; index++) {
+            Instant end = now.minusSeconds(index * 3600L);
+            String title = "联调 " + index;
+            timer.saveSession(null, title, end.minusSeconds(1800), end, "", false);
+            long taskId = timer.tasks().stream().filter(task -> task.title().equals(title)).findFirst().orElseThrow().id();
+            repository.bind(taskId, index < 3 ? timed : new Binding("other", "unrelated", "另一个组织"));
+        }
+        var loaded = quick.load(connection, today);
+        assertEquals(List.of(standalone), loaded.yesterday());
+        assertEquals(List.of(timed, standalone), loaded.recent());
+        assertEquals(List.of(new Row(timed, "1", "", false)), loaded.rows());
+
+        List<Row> input = List.of(new Row(timed, "1小", "待完善", false), new Row(standalone, "45m", "", false));
+        quick.saveDraft(connection, today, input);
+        assertEquals(input, servicesAt(now).quickEffort().load(connection, today).rows());
+        YunxiaoService another = new YunxiaoService(repository, new YunxiaoClient("", "org-2", "test-token", cloud::send));
+        assertTrue(quick.load(another, today).rows().isEmpty());
+        assertTrue(quick.load(another, today).yesterday().isEmpty());
+        assertThrows(IllegalArgumentException.class, () -> quick.saveDraft(another, today, input));
+        assertThrows(IllegalArgumentException.class, () -> quick.saveDraft(connection, today,
+                List.of(input.getFirst(), input.getFirst())));
+        cloud.assertDone();
+    }
+
+    @Test
+    void quickEffortKeepsSuccessfulRowsAndRecoversAnUncertainWriteByItsMarker() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoRepository repository = open();
+        YunxiaoService connection = new YunxiaoService(repository, cloud.central());
+        Instant now = Instant.parse("2026-11-12T20:00:00Z");
+        LocalDate day = LocalDate.ofInstant(now, ZoneOffset.UTC);
+        var quick = servicesAt(now).quickEffort();
+        Choice project = new Choice("project-1", "项目");
+        Binding first = quick.addTask(connection, project,
+                new Item("first", "", "开发", "", project.id(), "Task", "", ""));
+        Binding second = quick.addTask(connection, project,
+                new Item("second", "", "评审", "", project.id(), "Task", "", ""));
+        Row development = new Row(first, "2h", "完成导出联调", false);
+        Row review = new Row(second, "45m", "", false);
+        quick.saveDraft(connection, day, List.of(development, review));
+
+        cloud.answer("POST", "/workitems/first/effortRecords", request -> {
+            JsonObject effort = body(request);
+            assertEquals(new BigDecimal("2"), effort.get("actualTime").getAsBigDecimal());
+            assertTrue(effort.get("description").getAsString().startsWith("完成导出联调\n收工记#"));
+            return response(request, 201, "{\"id\":\"first-record\"}");
+        });
+        cloud.answer("POST", "/workitems/second/effortRecords", request -> response(request, 503, "{}"));
+        quick.submit(connection, day, development, new BigDecimal("2"), false, false);
+        assertThrows(ApiException.class, () -> quick.submit(connection, day, review, new BigDecimal("0.75"), false, false));
+        Row submittedFirst = new Row(first, "2h", "完成导出联调", true);
+        var reopened = servicesAt(now).quickEffort();
+        assertEquals(List.of(submittedFirst, review), reopened.load(connection, day).rows());
+
+        String marker = repository.findWrite(repository.findTaskForEffort(second, "effort:second:" + day),
+                connection.scope(), "effort:second:" + day).marker();
+        cloud.answer("GET", "/workitems/second/effortRecords",
+                "[{\"id\":\"second-record\",\"description\":\"" + marker + "\"}]");
+        cloud.answer("PUT", "/workitems/second/effortRecords/second-record", request -> {
+            assertEquals(new BigDecimal("0.75"), body(request).get("actualTime").getAsBigDecimal());
+            return response(request, 204, "");
+        });
+        reopened.submit(connection, day, review, new BigDecimal("0.75"), false, false);
+        assertEquals(List.of(submittedFirst, new Row(second, "45m", "", true)), quick.load(connection, day).rows());
+        assertEquals(List.of(first, second), quick.load(connection, day.plusDays(1)).yesterday());
+        cloud.assertDone();
+    }
+
+    @Test
+    void quickEffortConsumesOldLinkedQueueVersionsAndKeepsNewTimerWorkAndTheNote() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoService connection = new YunxiaoService(open(), cloud.central());
+        Choice project = new Choice("project-1", "项目");
+        Item parent = new Item("req-1", "", "需求", "", project.id(), "Req", "", "");
+        Item child = new Item("child-1", "", "联调", "", project.id(), "Task", parent.id(), "");
+        long first = connection.prepareAutomaticChild(new ChildDraft(project, parent, "task", "甲", "member", "", Map.of()));
+        long second = connection.prepareAutomaticChild(new ChildDraft(project, parent, "task", "乙", "member", "", Map.of()));
+        Binding binding = connection.bindAutomaticChild(first, child);
+        connection.bindAutomaticChild(second, child);
+        Instant start = Instant.parse("2026-11-12T10:00:00Z");
+        LocalDate day = LocalDate.ofInstant(start, ZoneOffset.UTC);
+        servicesAt(start).timer().start(first);
+        servicesAt(start.plusSeconds(3600)).timer().start(second);
+        Instant end = start.plusSeconds(7200);
+        AppServices services = servicesAt(end);
+        services.timer().pause(services.timer().active().id(), end, false);
+        assertEquals(2, services.yunxiaoAutoSync().pendingCount());
+
+        var quick = services.quickEffort();
+        Row row = new Row(binding, "4h", "今天的联调", false);
+        quick.saveDraft(connection, day, List.of(row));
+        cloud.answer("POST", "/workitems/child-1/effortRecords", request -> {
+            assertEquals(new BigDecimal("4"), body(request).get("actualTime").getAsBigDecimal());
+            assertDoesNotThrow(() -> services.timer().addWorkHours(day, second, "乙", 1800, "", false));
+            return response(request, 201, "{\"id\":\"shared-record\"}");
+        });
+        quick.submit(connection, day, row, new BigDecimal("4"), false, false);
+        assertEquals(1, services.yunxiaoAutoSync().pendingCount());
+        cloud.answer("PUT", "/workitems/child-1/effortRecords/shared-record", request -> {
+            JsonObject effort = body(request);
+            assertEquals(new BigDecimal("4.50"), effort.get("actualTime").getAsBigDecimal());
+            assertTrue(effort.get("description").getAsString().startsWith("今天的联调\n收工记#"));
+            return response(request, 204, "");
+        });
+        assertNull(services.yunxiaoAutoSync().sync(connection, null));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
         cloud.assertDone();
     }
 
@@ -511,6 +639,101 @@ class YunxiaoServiceTest {
         assertNull(services.yunxiaoAutoSync().sync(sync, null));
         assertEquals(0, services.yunxiaoAutoSync().pendingCount());
         cloud.assertDone();
+    }
+
+    @Test
+    void editingSyncedHoursUpdatesTheOriginalEffortOnlyWhenTheTotalChanges() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoService sync = new YunxiaoService(open(), cloud.central());
+        Instant end = Instant.parse("2026-11-12T12:00:00Z");
+        LocalDate day = LocalDate.ofInstant(end, ZoneOffset.UTC);
+        AppServices services = servicesAt(end);
+        uploadFirstHour(cloud, sync, services, end);
+
+        var entry = services.review().loadDay(day).entries().getFirst();
+        assertFalse(services.timer().editWorkHours(day, entry, entry.seconds(), "补充说明", false));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+
+        entry = services.review().loadDay(day).entries().getFirst();
+        assertTrue(services.timer().editWorkHours(day, entry, 2 * 3600, "补充说明", false));
+        assertEquals(1, services.yunxiaoAutoSync().pendingCount());
+        cloud.answer("PUT", "/workitems/child-1/effortRecords/effort-1", request -> {
+            JsonObject effort = body(request);
+            assertEquals(day.toString(), effort.get("gmtStart").getAsString());
+            assertEquals(new BigDecimal("2.00"), effort.get("actualTime").getAsBigDecimal());
+            return response(request, 204, "");
+        });
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        cloud.assertDone();
+    }
+
+    @Test
+    void editingHoursDuringUploadKeepsTheLatestTotalPendingEvenWhenItRoundsToZero() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoService sync = new YunxiaoService(open(), cloud.central());
+        Instant end = Instant.parse("2026-11-12T12:00:00Z");
+        LocalDate day = LocalDate.ofInstant(end, ZoneOffset.UTC);
+        AppServices services = servicesAt(end);
+        long taskId = uploadFirstHour(cloud, sync, services, end);
+
+        assertTrue(services.timer().addWorkHours(day, taskId, "修复导出", 1800, "", false));
+        var beforeEdit = services.review().loadDay(day).entries().getFirst();
+        assertEquals(5400, beforeEdit.seconds());
+        String path = "/workitems/child-1/effortRecords/effort-1";
+        cloud.answer("PUT", path, request -> {
+            assertEquals(new BigDecimal("1.50"), body(request).get("actualTime").getAsBigDecimal());
+            assertDoesNotThrow(() -> services.timer().editWorkHours(day, beforeEdit, 17, "", false));
+            return response(request, 204, "");
+        });
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+        assertEquals(1, services.yunxiaoAutoSync().pendingCount());
+
+        cloud.answer("PUT", path, request -> {
+            assertEquals(new BigDecimal("0.00"), body(request).get("actualTime").getAsBigDecimal());
+            return response(request, 422, "{}");
+        });
+        var failure = services.yunxiaoAutoSync().sync(sync, null);
+        assertNotNull(failure);
+        assertInstanceOf(ApiException.class, failure.cause());
+        assertEquals(1, services.yunxiaoAutoSync().pendingCount());
+        cloud.assertDone();
+    }
+
+    @Test
+    void roundedZeroDoesNotCreateANewEffortForAnotherDay() throws Exception {
+        Cloud cloud = new Cloud();
+        YunxiaoRepository repository = open();
+        YunxiaoService sync = new YunxiaoService(repository, cloud.central());
+        Instant end = Instant.parse("2026-11-12T12:00:00Z");
+        AppServices services = servicesAt(end);
+        long taskId = uploadFirstHour(cloud, sync, services, end);
+        LocalDate otherDay = LocalDate.ofInstant(end, ZoneOffset.UTC).minusDays(1);
+
+        assertTrue(services.timer().addWorkHours(otherDay, taskId, "修复导出", 17, "", false));
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        assertNull(repository.findWrite(taskId, sync.scope(), "effort:child-1:" + otherDay));
+        cloud.assertDone();
+    }
+
+    private long uploadFirstHour(Cloud cloud, YunxiaoService sync, AppServices services, Instant end) throws Exception {
+        Choice project = new Choice("project-1", "项目");
+        Item parent = new Item("req-1", "PRJ-1", "订单导出", "req-type", project.id(), "Req", "", "");
+        long taskId = sync.prepareAutomaticChild(
+                new ChildDraft(project, parent, "task-type", "修复导出", "member-1", "", Map.of()));
+        servicesAt(end.minusSeconds(3600)).timer().start(taskId);
+        services.timer().pause(services.timer().active().id(), end, false);
+        cloud.answer("POST", "/workitems", "{\"id\":\"child-1\"}");
+        cloud.answer("POST", "/workitems/child-1/effortRecords", request -> {
+            assertEquals(new BigDecimal("1.00"), body(request).get("actualTime").getAsBigDecimal());
+            return response(request, 201, "{\"id\":\"effort-1\"}");
+        });
+        assertNull(services.yunxiaoAutoSync().sync(sync, null));
+        assertEquals(0, services.yunxiaoAutoSync().pendingCount());
+        cloud.assertDone();
+        return taskId;
     }
 
     @Test

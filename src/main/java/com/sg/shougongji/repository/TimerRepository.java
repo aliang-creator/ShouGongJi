@@ -35,6 +35,10 @@ public final class TimerRepository {
         database.write(TimerMapper.class, change::apply);
     }
 
+    public <T> T inTransactionReturning(WorkLogDatabase.MapperQuery<TimerMapper, T> change) throws SQLException {
+        return database.writeReturning(TimerMapper.class, change);
+    }
+
     @FunctionalInterface
     public interface TimerChange {
         void apply(TimerMapper records) throws SQLException;

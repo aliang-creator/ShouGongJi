@@ -623,18 +623,23 @@ final class ReviewWindow {
         }
         VBox taskField = field("事项", original == null ? task : label(original.task().title(), "section-title", "wrap"));
         VBox durationField = new VBox(5, field(original == null ? "补录工时（小时）" : "当天总工时（小时）", hours),
-                label(DAY.format(selected) + " · 按全天上班时段排时，跳过午休和已占用时间。", "muted", "wrap"));
+                label(DAY.format(selected) + (original == null ? " · 按上班时段排时，跳过午休和已占用时间。"
+                        : " · 修改总工时会按上班时段重新排时。只改备注或估算标记会保留原时段。"), "muted", "wrap"));
         VBox fields = new VBox(12, taskField, durationField, field("备注或结果", note), estimated);
         Dialog<ButtonType> dialog = form(stage, original == null ? "补录工时" : "编辑工时", fields, "保存");
         bindSave(dialog, () -> {
             long seconds = parseHours(hours.getText());
+            boolean syncQueued;
             if (original != null) {
-                timer.editWorkHours(selected, original, seconds, note.getText(), estimated.isSelected());
+                syncQueued = timer.editWorkHours(selected, original, seconds, note.getText(), estimated.isSelected());
             } else {
                 String title = task.getEditor().getText().strip();
                 WorkTask chosen = choices.get(title);
-                timer.addWorkHours(selected, chosen == null ? null : chosen.id(), title, seconds,
+                syncQueued = timer.addWorkHours(selected, chosen == null ? null : chosen.id(), title, seconds,
                         note.getText(), estimated.isSelected());
+            }
+            if (syncQueued) {
+                perform(stage, app::requestAutoSync);
             }
         });
         if (dialog.showAndWait().filter(dialog.getDialogPane().getButtonTypes().getFirst()::equals).isPresent()) {

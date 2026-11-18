@@ -5,6 +5,7 @@ import com.sg.shougongji.model.Yunxiao.Binding;
 import com.sg.shougongji.model.Yunxiao.ConnectionSettings;
 import com.sg.shougongji.model.Yunxiao.PendingEffort;
 import com.sg.shougongji.model.Yunxiao.PendingWrite;
+import com.sg.shougongji.model.Yunxiao.QuickEffortReceipt;
 import org.apache.ibatis.annotations.Param;
 
 import java.util.List;
@@ -32,6 +33,21 @@ interface YunxiaoMapper {
 
     Long findTaskForEffort(@Param("binding") Binding binding, @Param("operation") String operation);
 
+    List<Binding> findQuickEffortBindings(@Param("scope") String scope);
+
+    List<Binding> findRegisteredBindings(@Param("scope") String scope, @Param("day") String day);
+
+    String findQuickEffortDraft(@Param("scope") String scope, @Param("day") String day);
+
+    void saveQuickEffortDraft(@Param("scope") String scope, @Param("day") String day, @Param("rows") String rows);
+
+    QuickEffortReceipt findQuickEffortReceipt(@Param("binding") Binding binding, @Param("day") String day);
+
+    void saveQuickEffortReceipt(@Param("binding") Binding binding, @Param("day") String day,
+                                @Param("receipt") QuickEffortReceipt receipt);
+
+    void clearQuickEffortBaseline(@Param("binding") Binding binding, @Param("day") String day);
+
     Long findChildTimerTask(@Param("scope") String scope, @Param("parentId") String parentId,
                             @Param("title") String title);
 
@@ -48,6 +64,8 @@ interface YunxiaoMapper {
 
     PendingEffort findPendingEffort(@Param("taskId") long taskId, @Param("day") String day);
 
+    List<PendingEffort> findLinkedPendingEfforts(@Param("binding") Binding binding, @Param("day") String day);
+
     int pendingEffortCount();
 
     List<Long> pendingEffortTasks(@Param("day") String day);
@@ -57,6 +75,9 @@ interface YunxiaoMapper {
     int saveBinding(@Param("taskId") long taskId, @Param("binding") Binding binding);
 
     boolean hasCreatedTask(@Param("taskId") long taskId, @Param("binding") Binding binding);
+
+    PendingWrite findWrite(@Param("taskId") long taskId, @Param("scope") String scope,
+                           @Param("operation") String operation);
 
     PendingWrite reserveWrite(@Param("taskId") long taskId, @Param("scope") String scope,
                               @Param("operation") String operation, @Param("marker") String marker);

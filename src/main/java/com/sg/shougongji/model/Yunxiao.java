@@ -33,6 +33,8 @@ public final class Yunxiao {
 
     public record PendingEffort(long taskId, String day, String revision, String title) {}
 
+    public record QuickEffortReceipt(String note, BigDecimal hours, long timedSeconds) {}
+
     public record Choice(String id, String name) {
         @Override
         public String toString() {

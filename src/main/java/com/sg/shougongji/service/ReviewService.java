@@ -36,6 +36,18 @@ public final class ReviewService {
                 yunxiao.pendingEffortTasks(date.toString()));
     }
 
+    long linkedSeconds(LocalDate date, long taskId, Binding target) throws SQLException {
+        Map<Long, Binding> bindings = target == null ? Map.of() : yunxiao.findBindings();
+        return loadDay(date).entries().stream()
+                .filter(entry -> entry.task().id() == taskId || sameWorkItem(target, bindings.get(entry.task().id())))
+                .mapToLong(DayReview.Entry::seconds).sum();
+    }
+
+    private static boolean sameWorkItem(Binding target, Binding candidate) {
+        return target != null && candidate != null && target.scope().equals(candidate.scope())
+                && target.childId().equals(candidate.childId());
+    }
+
     public record Overview(DayReview review, Map<Long, Binding> bindings, WorkSession activeSession,
                            Set<Long> pendingEffortTasks) {}
 }
